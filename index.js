@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v1.0
+// SOL COPY TRADING BOT v1.0 - PAPER + LIVE MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -46,7 +46,14 @@ async function init() {
       process.exit(1);
     }
     keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-    console.log('LIVE MODE - Wallet:', keypair.publicKey.toBase58());
+    const derivedPubkey = keypair.publicKey.toBase58();
+    if (derivedPubkey !== WALLET) {
+      console.error('ERROR: PRIVATE_KEY does not match WALLET_ADDRESS');
+      console.error('  Key derives:', derivedPubkey);
+      console.error('  Expected:   ', WALLET);
+      process.exit(1);
+    }
+    console.log('LIVE MODE - Wallet verified:', derivedPubkey);
   }
 
   console.log('Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
@@ -77,15 +84,18 @@ async function fetchWhaleTxs(wallet) {
   }
 }
 
-// Jupiter swap execution (live mode)
+// Jupiter swap execution
 async function executeSwap(inputMint, outputMint, amountLamports) {
   try {
     // Get quote
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${SLIPPAGE_BPS}`;
+    const quoteUrl = 'https://quote-api.jup.ag/v6/quote?inputMint=' + inputMint +
+      '&outputMint=' + outputMint +
+      '&amount=' + amountLamports +
+      '&slippageBps=' + SLIPPAGE_BPS;
     const quoteRes = await fetch(quoteUrl);
     if (!quoteRes.ok) {
       console.error('[SWAP] Quote failed:', quoteRes.status);
-      return false;
+      return null;
     }
     const quote = await quoteRes.json();
 
@@ -95,42 +105,40 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         quoteResponse: quote,
-        userPublicKey: keypair.publicKey.toBase58(),
+        userPublicKey: WALLET,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
         prioritizationFeeLamports: 'auto',
       }),
     });
     if (!swapRes.ok) {
-      console.error('[SWAP] Swap request failed:', swapRes.status);
-      return false;
+      console.error('[SWAP] Swap tx failed:', swapRes.status);
+      return null;
     }
-    const swapData = await swapRes.json();
+    const { swapTransaction } = await swapRes.json();
 
-    // Deserialize and sign
-    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+    // Sign and send
+    const txBuf = Buffer.from(swapTransaction, 'base64');
     const tx = VersionedTransaction.deserialize(txBuf);
     tx.sign([keypair]);
 
-    // Send transaction
-    const rawTx = tx.serialize();
-    const sig = await connection.sendRawTransaction(rawTx, {
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
       skipPreflight: true,
       maxRetries: 3,
     });
     console.log('[SWAP] Tx sent:', sig);
 
     // Confirm
-    const confirmation = await connection.confirmTransaction(sig, 'confirmed');
-    if (confirmation.value.err) {
-      console.error('[SWAP] Tx failed on-chain:', confirmation.value.err);
-      return false;
+    const confirm = await connection.confirmTransaction(sig, 'confirmed');
+    if (confirm.value.err) {
+      console.error('[SWAP] Tx failed on-chain:', confirm.value.err);
+      return null;
     }
     console.log('[SWAP] Confirmed:', sig);
-    return true;
-  } catch (err) {
-    console.error('[SWAP] Error:', err.message);
-    return false;
+    return sig;
+  } catch (e) {
+    console.error('[SWAP] Error:', e.message);
+    return null;
   }
 }
 
@@ -141,12 +149,19 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
 
   // Live execution: buy token via Jupiter
   if (!PAPER_MODE) {
-    const amountLamports = Math.floor(invest * LAMPORTS_PER_SOL);
-    const success = await executeSwap(SOL_MINT, mint, amountLamports);
-    if (!success) {
-      console.error('[BUY] Live swap failed for', symbol);
+    const lamports = Math.floor(invest * LAMPORTS_PER_SOL);
+    const sig = await executeSwap(SOL_MINT, mint, lamports);
+    if (!sig) {
+      console.error('[BUY] Live swap failed for', symbol, '- skipping');
       return;
     }
+    console.log('[BUY-LIVE] Executed:', sig);
+    // Refresh balance after swap
+    const pubkey = new PublicKey(WALLET);
+    const bal = await connection.getBalance(pubkey);
+    portfolio.balance = bal / LAMPORTS_PER_SOL;
+  } else {
+    portfolio.balance -= invest;
   }
 
   const tokens = invest / entryPrice;
@@ -159,11 +174,12 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
     tp: entryPrice * TAKE_PROFIT,
     sl: entryPrice * (1 + STOP_LOSS),
   };
-  portfolio.balance -= invest;
 
+  const tpPrice = (entryPrice * TAKE_PROFIT).toFixed(8);
+  const slPrice = (entryPrice * (1 + STOP_LOSS)).toFixed(8);
   const mode = PAPER_MODE ? 'PAPER' : 'LIVE';
   console.log('[BUY-' + mode + ']', symbol, '| Entry:', entryPrice.toFixed(8), '| Invested:', invest.toFixed(4), 'SOL');
-  console.log('      TP:', (entryPrice * TAKE_PROFIT).toFixed(8), '| SL:', (entryPrice * (1 + STOP_LOSS)).toFixed(8));
+  console.log('      TP:', tpPrice, '| SL:', slPrice);
 }
 
 async function closePosition(mint, reason, exitPrice) {
@@ -173,28 +189,32 @@ async function closePosition(mint, reason, exitPrice) {
   // Live execution: sell token via Jupiter
   if (!PAPER_MODE) {
     // Get token balance for this mint
-    const accounts = await connection.getParsedTokenAccountsByOwner(
-      keypair.publicKey,
-      { mint: new PublicKey(mint) }
-    );
-    if (accounts.value.length > 0) {
-      const tokenAmount = accounts.value[0].account.data.parsed.info.tokenAmount;
-      const rawAmount = tokenAmount.amount;
-      if (parseInt(rawAmount) > 0) {
-        const success = await executeSwap(mint, SOL_MINT, rawAmount);
-        if (!success) {
-          console.error('[SELL] Live swap failed for', pos.symbol, '- will retry next cycle');
+    const pubkey = new PublicKey(WALLET);
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(pubkey, { mint: new PublicKey(mint) });
+    if (tokenAccounts.value.length > 0) {
+      const tokenBalance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+      const rawAmount = tokenBalance.amount;
+      if (rawAmount !== '0') {
+        const sig = await executeSwap(mint, SOL_MINT, rawAmount);
+        if (!sig) {
+          console.error('[SELL] Live swap failed for', pos.symbol, '- keeping position');
           return;
         }
+        console.log('[SELL-LIVE] Executed:', sig);
       }
     }
+    // Refresh balance
+    const bal = await connection.getBalance(pubkey);
+    portfolio.balance = bal / LAMPORTS_PER_SOL;
   }
 
   const received = pos.tokens * exitPrice;
   const pnl = received - pos.invested;
   const pct = ((pnl / pos.invested) * 100).toFixed(1);
 
-  portfolio.balance += received;
+  if (PAPER_MODE) {
+    portfolio.balance += received;
+  }
   portfolio.totalPnL += pnl;
   portfolio.trades.push({
     mint,
@@ -265,7 +285,7 @@ async function monitorWhales() {
 function printStatus() {
   const openCount = Object.keys(portfolio.positions).length;
   console.log('\n--- STATUS ---');
-  console.log('Mode:', PAPER_MODE ? 'PAPER' : '** LIVE **');
+  console.log('Mode:', PAPER_MODE ? 'PAPER (safe)' : '*** LIVE EXECUTION ***');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
   console.log('Open positions:', openCount);
   console.log('Total trades:', portfolio.trades.length);
@@ -276,7 +296,7 @@ function printStatus() {
 async function main() {
   console.log('========================================');
   console.log('  SOL COPY TRADING BOT v1.0');
-  console.log('  Mode:', PAPER_MODE ? 'PAPER (safe)' : 'LIVE (real trades)');
+  console.log('  Mode:', PAPER_MODE ? 'PAPER (no real trades)' : 'LIVE (real money!)');
   console.log('========================================');
 
   if (!HELIUS_KEY) { console.error('ERROR: HELIUS_API_KEY not set'); process.exit(1); }
@@ -287,7 +307,7 @@ async function main() {
   WHALE_WALLETS.forEach(function(w, i) {
     console.log('  ' + (i + 1) + '.', w.slice(0, 12) + '...');
   });
-  console.log('TP: 2x | SL: -30% | Max position: 20%');
+  console.log('TP: 2x | SL: -30% | Max position: 20% | Slippage: 15%');
   console.log('Running...\n');
 
   printStatus();
