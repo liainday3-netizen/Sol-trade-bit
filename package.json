@@ -1,15 +1,18 @@
 {
-  "name": "sol-trade-bot",
+  "name": "sol-copy-trading-bot",
   "version": "1.0.0",
-  "type": "module",
+  "description": "SOL Copy Trading Bot",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@solana/web3.js": "^1.87.0",
-    "@solana/spl-token": "^0.3.9",
+    "@solana/web3.js": "^1.98.0",
+    "@solana/spl-token": "^0.4.9",
     "bs58": "^5.0.0"
   }
 }
-
