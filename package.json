@@ -1,1 +1,15 @@
-{"name":"sol-copy-trade-bot","version":"1.0.0","type":"module","main":"index.js","scripts":{"start":"node index.js"},"dependencies":{"@solana/web3.js":"^1.95.0","@solana/spl-token":"^0.4.0","bs58":"^5.0.0"}}
+{
+  "name": "sol-trade-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.87.0",
+    "@solana/spl-token": "^0.3.9",
+    "bs58": "^5.0.0"
+  }
+}
+
