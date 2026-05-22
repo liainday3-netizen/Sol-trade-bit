@@ -1,4 +1,4 @@
-/ SOL COPY TRADING BOT v1.0 - PAPER MODE
+/ / SOL COPY TRADING BOT v1.0 - PAPER MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
 import { getAssociatedTokenAddress } from '@solana/spl-token';
 import bs58 from 'bs58';
