@@ -1,14 +1,18 @@
-// SOL COPY TRADING BOT v1.0 - PAPER MODE
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+// SOL COPY TRADING BOT v1.0
+import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import bs58 from 'bs58';
 
 const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
+const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 const TAKE_PROFIT = 2.0;
 const STOP_LOSS = -0.30;
 const MAX_POSITION_PCT = 0.20;
 const INTERVAL_MS = 30000;
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const SLIPPAGE_BPS = 1500; // 15% slippage for memecoins
 
 // Curated high-performance whale wallets (verified profitable traders)
 const WHALE_WALLETS = [
@@ -27,6 +31,7 @@ const portfolio = {
 
 const processedTxs = new Set();
 let connection;
+let keypair;
 
 async function init() {
   const rpc = 'https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY;
@@ -34,6 +39,16 @@ async function init() {
   const pubkey = new PublicKey(WALLET);
   const lamports = await connection.getBalance(pubkey);
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
+
+  if (!PAPER_MODE) {
+    if (!PRIVATE_KEY) {
+      console.error('ERROR: PRIVATE_KEY required for live mode');
+      process.exit(1);
+    }
+    keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+    console.log('LIVE MODE - Wallet:', keypair.publicKey.toBase58());
+  }
+
   console.log('Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -62,10 +77,77 @@ async function fetchWhaleTxs(wallet) {
   }
 }
 
-function openPosition(mint, symbol, entryPrice, solAmount) {
+// Jupiter swap execution (live mode)
+async function executeSwap(inputMint, outputMint, amountLamports) {
+  try {
+    // Get quote
+    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${SLIPPAGE_BPS}`;
+    const quoteRes = await fetch(quoteUrl);
+    if (!quoteRes.ok) {
+      console.error('[SWAP] Quote failed:', quoteRes.status);
+      return false;
+    }
+    const quote = await quoteRes.json();
+
+    // Get swap transaction
+    const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: keypair.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: 'auto',
+      }),
+    });
+    if (!swapRes.ok) {
+      console.error('[SWAP] Swap request failed:', swapRes.status);
+      return false;
+    }
+    const swapData = await swapRes.json();
+
+    // Deserialize and sign
+    const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+    const tx = VersionedTransaction.deserialize(txBuf);
+    tx.sign([keypair]);
+
+    // Send transaction
+    const rawTx = tx.serialize();
+    const sig = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: true,
+      maxRetries: 3,
+    });
+    console.log('[SWAP] Tx sent:', sig);
+
+    // Confirm
+    const confirmation = await connection.confirmTransaction(sig, 'confirmed');
+    if (confirmation.value.err) {
+      console.error('[SWAP] Tx failed on-chain:', confirmation.value.err);
+      return false;
+    }
+    console.log('[SWAP] Confirmed:', sig);
+    return true;
+  } catch (err) {
+    console.error('[SWAP] Error:', err.message);
+    return false;
+  }
+}
+
+async function openPosition(mint, symbol, entryPrice, solAmount) {
   const maxSol = portfolio.balance * MAX_POSITION_PCT;
   const invest = Math.min(solAmount, maxSol);
   if (invest < 0.005) return;
+
+  // Live execution: buy token via Jupiter
+  if (!PAPER_MODE) {
+    const amountLamports = Math.floor(invest * LAMPORTS_PER_SOL);
+    const success = await executeSwap(SOL_MINT, mint, amountLamports);
+    if (!success) {
+      console.error('[BUY] Live swap failed for', symbol);
+      return;
+    }
+  }
 
   const tokens = invest / entryPrice;
   portfolio.positions[mint] = {
@@ -79,15 +161,34 @@ function openPosition(mint, symbol, entryPrice, solAmount) {
   };
   portfolio.balance -= invest;
 
-  const tpPrice = (entryPrice * TAKE_PROFIT).toFixed(8);
-  const slPrice = (entryPrice * (1 + STOP_LOSS)).toFixed(8);
-  console.log('[BUY]', symbol, '| Entry:', entryPrice.toFixed(8), '| Invested:', invest.toFixed(4), 'SOL');
-  console.log('      TP:', tpPrice, '| SL:', slPrice);
+  const mode = PAPER_MODE ? 'PAPER' : 'LIVE';
+  console.log('[BUY-' + mode + ']', symbol, '| Entry:', entryPrice.toFixed(8), '| Invested:', invest.toFixed(4), 'SOL');
+  console.log('      TP:', (entryPrice * TAKE_PROFIT).toFixed(8), '| SL:', (entryPrice * (1 + STOP_LOSS)).toFixed(8));
 }
 
-function closePosition(mint, reason, exitPrice) {
+async function closePosition(mint, reason, exitPrice) {
   const pos = portfolio.positions[mint];
   if (!pos) return;
+
+  // Live execution: sell token via Jupiter
+  if (!PAPER_MODE) {
+    // Get token balance for this mint
+    const accounts = await connection.getParsedTokenAccountsByOwner(
+      keypair.publicKey,
+      { mint: new PublicKey(mint) }
+    );
+    if (accounts.value.length > 0) {
+      const tokenAmount = accounts.value[0].account.data.parsed.info.tokenAmount;
+      const rawAmount = tokenAmount.amount;
+      if (parseInt(rawAmount) > 0) {
+        const success = await executeSwap(mint, SOL_MINT, rawAmount);
+        if (!success) {
+          console.error('[SELL] Live swap failed for', pos.symbol, '- will retry next cycle');
+          return;
+        }
+      }
+    }
+  }
 
   const received = pos.tokens * exitPrice;
   const pnl = received - pos.invested;
@@ -106,7 +207,8 @@ function closePosition(mint, reason, exitPrice) {
   delete portfolio.positions[mint];
 
   const tag = pnl >= 0 ? 'PROFIT' : 'LOSS';
-  console.log('[SELL -', tag + ']', pos.symbol, '(' + reason + ') | PnL:', pnl.toFixed(4), 'SOL (' + pct + '%)');
+  const mode = PAPER_MODE ? 'PAPER' : 'LIVE';
+  console.log('[SELL-' + mode + ' ' + tag + ']', pos.symbol, '(' + reason + ') | PnL:', pnl.toFixed(4), 'SOL (' + pct + '%)');
 }
 
 async function checkPositions() {
@@ -119,11 +221,11 @@ async function checkPositions() {
     const heldHours = (Date.now() - pos.entryTime) / 3600000;
 
     if (price >= pos.tp) {
-      closePosition(mint, 'TAKE_PROFIT', price);
+      await closePosition(mint, 'TAKE_PROFIT', price);
     } else if (price <= pos.sl) {
-      closePosition(mint, 'STOP_LOSS', price);
+      await closePosition(mint, 'STOP_LOSS', price);
     } else if (heldHours >= 24) {
-      closePosition(mint, 'TIME_LIMIT', price);
+      await closePosition(mint, 'TIME_LIMIT', price);
     } else {
       const chg = (((price - pos.entryPrice) / pos.entryPrice) * 100).toFixed(1);
       console.log('[HOLD]', pos.symbol, '| Change:', chg + '%', '| Held:', heldHours.toFixed(1) + 'h');
@@ -154,7 +256,7 @@ async function monitorWhales() {
         if (!price) continue;
 
         console.log('[WHALE] Swap by', whale.slice(0, 8) + '... | Token:', t.mint.slice(0, 8) + '...');
-        openPosition(t.mint, t.mint.slice(0, 6) + '...', price, 0.1);
+        await openPosition(t.mint, t.mint.slice(0, 6) + '...', price, 0.1);
       }
     }
   }
@@ -163,7 +265,7 @@ async function monitorWhales() {
 function printStatus() {
   const openCount = Object.keys(portfolio.positions).length;
   console.log('\n--- STATUS ---');
-  console.log('Mode:', PAPER_MODE ? 'PAPER' : 'LIVE');
+  console.log('Mode:', PAPER_MODE ? 'PAPER' : '** LIVE **');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
   console.log('Open positions:', openCount);
   console.log('Total trades:', portfolio.trades.length);
@@ -173,7 +275,8 @@ function printStatus() {
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v1.0 - PAPER MODE');
+  console.log('  SOL COPY TRADING BOT v1.0');
+  console.log('  Mode:', PAPER_MODE ? 'PAPER (safe)' : 'LIVE (real trades)');
   console.log('========================================');
 
   if (!HELIUS_KEY) { console.error('ERROR: HELIUS_API_KEY not set'); process.exit(1); }
