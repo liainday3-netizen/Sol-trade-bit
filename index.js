@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v1.1 - EXPANDED WATCHLIST
+// SOL COPY TRADING BOT v1.2 - BALANCE REFRESH + EXPANDED WATCHLIST
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -11,7 +11,7 @@ const TAKE_PROFIT = 2.0;
 const STOP_LOSS = -0.30;
 const MAX_POSITION_PCT = 0.20;
 const INTERVAL_MS = 20000; // Faster polling: 20s instead of 30s
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const SOL_MINT = 'So11111111111111111111111111111111111111111112';
 const SLIPPAGE_BPS = 1500;
 
 // EXPANDED WHALE WALLET LIST (10 wallets for higher trade frequency)
@@ -37,9 +37,13 @@ const portfolio = {
   totalPnL: 0,
 };
 
+const BALANCE_REFRESH_INTERVAL = 5; // Refresh on-chain balance every 5 cycles (100s)
+
 const processedTxs = new Set();
 let connection;
 let keypair;
+let lastKnownOnChainBalance = 0;
+let cycleCount = 0;
 
 async function init() {
   const rpc = 'https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY;
@@ -47,6 +51,7 @@ async function init() {
   const pubkey = new PublicKey(WALLET);
   const lamports = await connection.getBalance(pubkey);
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
+  lastKnownOnChainBalance = portfolio.balance;
 
   if (!PAPER_MODE) {
     if (!PRIVATE_KEY) {
@@ -309,12 +314,31 @@ function printStatus() {
   console.log('--------------\n');
 }
 
+// Periodic on-chain balance refresh to detect new deposits
+async function refreshBalance() {
+  try {
+    const pubkey = new PublicKey(WALLET);
+    const lamports = await connection.getBalance(pubkey);
+    const onChainBalance = lamports / LAMPORTS_PER_SOL;
+
+    if (onChainBalance > lastKnownOnChainBalance && lastKnownOnChainBalance > 0) {
+      const deposit = onChainBalance - lastKnownOnChainBalance;
+      portfolio.balance += deposit;
+      console.log('[DEPOSIT] Detected +' + deposit.toFixed(4) + ' SOL | New balance:', portfolio.balance.toFixed(4), 'SOL');
+    }
+
+    lastKnownOnChainBalance = onChainBalance;
+  } catch (e) {
+    console.error('[BALANCE] Refresh error:', e.message);
+  }
+}
+
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v1.1');
+  console.log('  SOL COPY TRADING BOT v1.2');
   console.log('  Mode:', PAPER_MODE ? 'PAPER (no real trades)' : 'LIVE (real money!)');
   console.log('  Wallets:', WHALE_WALLETS.length, '| Poll:', INTERVAL_MS / 1000 + 's');
-  console.log('========================================');
+  console.log('============================================');
 
   if (!HELIUS_KEY) { console.error('ERROR: HELIUS_API_KEY not set'); process.exit(1); }
   if (!BIRDEYE_KEY) { console.error('ERROR: BIRDEYE_API_KEY not set'); process.exit(1); }
@@ -331,6 +355,11 @@ async function main() {
 
   setInterval(async () => {
     try {
+      cycleCount++;
+      // Refresh on-chain balance every 5 cycles to detect deposits
+      if (cycleCount % BALANCE_REFRESH_INTERVAL === 0) {
+        await refreshBalance();
+      }
       await monitorWhales();
       await checkPositions();
       cleanupProcessed();
