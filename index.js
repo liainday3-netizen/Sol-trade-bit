@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v2.7 - POWER HUNTER
+// SOL COPY TRADING BOT v2.8 - POWER HUNTER UPGRADE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -9,14 +9,14 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 
 const TAKE_PROFIT = 5.0;
-const STOP_LOSS = -0.80;
-const MAX_POSITION_PCT = 0.45;
+const STOP_LOSS = -0.85;
+const MAX_POSITION_PCT = 0.50;
 const MAX_POSITIONS = 4;
 const INTERVAL_MS = 45000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
-const SLIPPAGE_BPS = 5000;
+const SLIPPAGE_BPS = 5500;
 
-const WHALE_WALLETS = [ /* your 10 wallets */ ];
+const WHALE_WALLETS = [ /* your 10 wallets here */ ];
 
 const portfolio = { balance: 0, positions: {}, trades: [], totalPnL: 0 };
 let connection, keypair, lastKnownOnChainBalance = 0;
@@ -52,7 +52,7 @@ async function fetchPrice(mint) {
 }
 
 async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.022);
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.025);
   let invest = Math.min(solAmount, maxSol);
   if (invest < 0.003 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
@@ -69,7 +69,7 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
 async function monitorWhales() {
   console.log(`🔥 [POWER HUNTER SCAN] Looking for winners...`);
   for (const whale of WHALE_WALLETS) {
-    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=25`) || [];
+    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=30`) || [];
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
@@ -81,9 +81,9 @@ async function monitorWhales() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && price > 0.00000003) {
-          console.log(`🔥🔥🔥 [HOT HUNTER SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.02);
+        if (price && price > 0.00000002) {
+          console.log(`🔥🔥🔥 [STRONG POWER SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.022);
         }
       }
     }
@@ -101,8 +101,8 @@ function printStatus() {
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v2.7 - POWER HUNTER');
-  console.log('  We have the power - Let\'s eat!');
+  console.log('  SOL COPY TRADING BOT v2.8 - POWER HUNTER');
+  console.log('  We have the power - Let\'s hunt!');
   console.log('========================================');
 
   await init();
