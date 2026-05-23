@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v3.1 - AGGRESSIVE LEARNING MODE
+// SOL COPY TRADING BOT v3.1 - MOVEMENT MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -8,13 +8,12 @@ const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 
-const TAKE_PROFIT = 5.0;
-const STOP_LOSS = -0.90;
-const MAX_POSITION_PCT = 0.60;
-const MAX_POSITIONS = 5;
+const TAKE_PROFIT = 6.0;
+const STOP_LOSS = -0.95;
+const MAX_POSITION_PCT = 0.70;
+const MAX_POSITIONS = 6;
 const INTERVAL_MS = 60000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
-const SLIPPAGE_BPS = 6000;
 
 const WHALE_WALLETS = [ /* your 10 wallets */ ];
 
@@ -40,7 +39,7 @@ async function init() {
   const lamports = await connection.getBalance(pubkey);
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
 
-  console.log('📝 PAPER MODE - AGGRESSIVE LEARNING');
+  console.log('📝 PAPER MODE - MOVEMENT MODE (Aggressive)');
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -52,18 +51,19 @@ async function fetchPrice(mint) {
 }
 
 async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.03);
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.035);
   let invest = Math.min(solAmount, maxSol);
-  if (invest < 0.0025 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
+  if (invest < 0.002 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
-  portfolio.balance -= invest; // Paper only
+  portfolio.balance -= invest;
 
   portfolio.positions[mint] = { symbol, entryPrice, tokens: invest/entryPrice, invested: invest, entryTime: Date.now() };
-  console.log(`🚀🚀 [PAPER BUY] ${symbol} | ${invest.toFixed(4)} SOL @ ${entryPrice}`);
+  console.log(`🚀🚀 [PAPER BUY MOVEMENT] ${symbol} | ${invest.toFixed(4)} SOL @ ${entryPrice}`);
 }
 
-async function monitorWhales() {
-  console.log(`🔥 [AGGRESSIVE SCAN] Hunting for any opportunity...`);
+async function monitorActivity() {
+  console.log(`🔥 [MOVEMENT SCAN] Looking for any action...`);
+
   for (const whale of WHALE_WALLETS) {
     const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=30`) || [];
     for (const tx of txs) {
@@ -77,9 +77,9 @@ async function monitorWhales() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && price > 0.00000001) {
-          console.log(`🔥🔥 [AGGRESSIVE SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.025);
+        if (price && price > 0.000000005) {   // Very low threshold
+          console.log(`🔥 [MOVEMENT SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.028);
         }
       }
     }
@@ -87,17 +87,18 @@ async function monitorWhales() {
 }
 
 function printStatus() {
-  console.log('\n--- AGGRESSIVE HUNTER STATUS ---');
+  console.log('\n--- MOVEMENT STATUS ---');
   console.log('Mode: 📝 PAPER');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
-  console.log('Positions:', Object.keys(portfolio.positions).length + '/5');
+  console.log('Positions:', Object.keys(portfolio.positions).length + '/6');
   console.log('Total PnL:', portfolio.totalPnL.toFixed(4), 'SOL');
   console.log('--------------\n');
 }
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v3.1 - AGGRESSIVE LEARNING');
+  console.log('  SOL COPY TRADING BOT v3.1 - MOVEMENT MODE');
+  console.log('  We just want to see action');
   console.log('========================================');
 
   await init();
@@ -105,7 +106,7 @@ async function main() {
 
   setInterval(async () => {
     try {
-      await monitorWhales();
+      await monitorActivity();
       printStatus();
     } catch (err) {
       console.error('[ERROR]', err.message);
