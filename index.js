@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v2.0 - PROFITABLE STRENGTH v4
+// SOL COPY TRADING BOT v2.1 - PROFITABLE STRENGTH v5
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -9,14 +9,14 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 
 const TAKE_PROFIT = 4.0;
-const STOP_LOSS = -0.60;
-const MAX_POSITION_PCT = 0.28;
+const STOP_LOSS = -0.65;
+const MAX_POSITION_PCT = 0.25;
 const MAX_POSITIONS = 5;
 const INTERVAL_MS = 45000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
-const SLIPPAGE_BPS = 2800;
+const SLIPPAGE_BPS = 3000;
 
-const WHALE_WALLETS = [ /* your list */ 
+const WHALE_WALLETS = [
   'AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm',
   '4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t',
   '8zFZHuSRuDpuAR7J6FzwyF3vKNx4CVW3DFHJerQhc7Zd',
@@ -67,7 +67,7 @@ async function fetchPrice(mint) {
 }
 
 async function fetchWhaleTxs(wallet) {
-  const url = `https://api.helius.xyz/v0/addresses/\( {wallet}/transactions?api-key= \){HELIUS_KEY}&limit=15`;
+  const url = `https://api.helius.xyz/v0/addresses/\( {wallet}/transactions?api-key= \){HELIUS_KEY}&limit=20`;
   return await safeFetch(url) || [];
 }
 
@@ -84,7 +84,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
         userPublicKey: WALLET,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 90000,
+        prioritizationFeeLamports: 100000,
       })
     });
 
@@ -105,9 +105,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
 async function openPosition(mint, symbol, entryPrice, solAmount) {
   const maxSol = portfolio.balance * MAX_POSITION_PCT;
   let invest = Math.min(solAmount, maxSol);
-  if (invest < 0.006 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
-
-  invest = Math.max(invest * 0.85, 0.006);
+  if (invest < 0.005 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
   if (!PAPER_MODE) {
     const sig = await executeSwap(SOL_MINT, mint, Math.floor(invest * LAMPORTS_PER_SOL));
@@ -148,21 +146,22 @@ async function checkPositions() {
 
     if (price >= pos.tp) await closePosition(mint, 'TP', price);
     else if (price <= pos.sl) await closePosition(mint, 'SL', price);
-    else if (heldHours >= 12) await closePosition(mint, 'TIME', price);
+    else if (heldHours >= 10) await closePosition(mint, 'TIME', price);
   }
 }
 
 async function monitorWhales() {
-  console.log(`🔍 [SCAN] Checking 10 whales...`);
+  console.log(`🔍 [SCAN] Checking 10 whales for activity...`);
   for (const whale of WHALE_WALLETS) {
     const txs = await fetchWhaleTxs(whale);
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
 
+      // Very loose detection
       const isSwap = tx.type === 'SWAP' || 
                     (tx.description && tx.description.toLowerCase().includes('swap')) ||
-                    (tx.tokenTransfers && tx.tokenTransfers.length > 1);
+                    (tx.tokenTransfers && tx.tokenTransfers.length >= 1);
 
       if (!isSwap) continue;
 
@@ -170,9 +169,9 @@ async function monitorWhales() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && price > 0.0000001) {
-          console.log(`🔥🔥 [STRONG SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.14);
+        if (price && price > 0.00000005) {
+          console.log(`🔥🔥🔥 [HOT SIGNAL] ${whale.slice(0,8)}... bought ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.15);
         }
       }
     }
@@ -191,8 +190,8 @@ function printStatus() {
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v2.0 - MAX PROFIT MODE');
-  console.log('  REAL MONEY - Going for the Wins');
+  console.log('  SOL COPY TRADING BOT v2.1 - MAX PROFIT MODE');
+  console.log('  REAL MONEY - Aggressive but Controlled');
   console.log('========================================');
 
   await init();
