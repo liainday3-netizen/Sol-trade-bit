@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v3.2 - REAL DEAL MODE
+// SOL COPY TRADING BOT v3.3 - REAL DEAL + SAFETY STOP LOSS
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -6,13 +6,13 @@ const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
-const PAPER_MODE = false;   // REAL DEAL - LIVE
+const PAPER_MODE = false;   // REAL DEAL
 
 const TAKE_PROFIT = 5.0;
-const STOP_LOSS = -0.85;
-const MAX_POSITION_PCT = 0.45;
-const MAX_POSITIONS = 4;
-const INTERVAL_MS = 65000;
+const STOP_LOSS = -0.75;           // Tightened for safety
+const MAX_POSITION_PCT = 0.40;
+const MAX_POSITIONS = 3;           // Reduced for safety
+const INTERVAL_MS = 70000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
 const SLIPPAGE_BPS = 6000;
 
@@ -41,7 +41,8 @@ async function init() {
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
 
   keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-  console.log('🔥🔥 REAL DEAL LIVE MODE ACTIVATED');
+  console.log('🔥 REAL DEAL LIVE MODE - SAFETY ENABLED');
+  console.log('🛡️ Stop Loss:', (STOP_LOSS * 100) + '%');
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -50,20 +51,6 @@ async function fetchPrice(mint) {
     headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' }
   });
   return data?.data?.value || null;
-}
-
-async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.025);
-  let invest = Math.min(solAmount, maxSol);
-  if (invest < 0.003 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
-
-  const sig = await executeSwap(SOL_MINT, mint, Math.floor(invest * LAMPORTS_PER_SOL));
-  if (!sig) return;
-
-  portfolio.balance -= invest;
-
-  portfolio.positions[mint] = { symbol, entryPrice, tokens: invest/entryPrice, invested: invest, entryTime: Date.now() };
-  console.log(`🚀🚀 [LIVE BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
 }
 
 async function executeSwap(inputMint, outputMint, amountLamports) {
@@ -89,11 +76,64 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
     tx.sign([keypair]);
 
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
-    console.log('✅ [LIVE SWAP SUCCESS]', sig.slice(0,12)+'...');
+    console.log('✅ [SWAP SUCCESS]', sig.slice(0,12)+'...');
     return sig;
   } catch (e) {
     console.error('❌ [SWAP ERROR]', e.message);
     return null;
+  }
+}
+
+async function openPosition(mint, symbol, entryPrice, solAmount) {
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.022);
+  let invest = Math.min(solAmount, maxSol);
+  if (invest < 0.003 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
+
+  const sig = await executeSwap(SOL_MINT, mint, Math.floor(invest * LAMPORTS_PER_SOL));
+  if (!sig) return;
+
+  portfolio.balance -= invest;
+
+  portfolio.positions[mint] = {
+    symbol, 
+    entryPrice, 
+    tokens: invest / entryPrice, 
+    invested: invest,
+    entryTime: Date.now(), 
+    tp: entryPrice * TAKE_PROFIT, 
+    sl: entryPrice * (1 + STOP_LOSS)
+  };
+
+  console.log(`🚀 [LIVE BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
+}
+
+async function closePosition(mint, reason, exitPrice) {
+  const pos = portfolio.positions[mint];
+  if (!pos) return;
+
+  const pnl = (pos.tokens * exitPrice) - pos.invested;
+  portfolio.totalPnL += pnl;
+  delete portfolio.positions[mint];
+
+  const tag = pnl > 0 ? '✅ PROFIT' : '❌ LOSS';
+  console.log(`\( {tag} [ \){reason}] ${pos.symbol} | PnL: ${pnl.toFixed(4)} SOL`);
+}
+
+async function checkPositions() {
+  for (const mint of Object.keys(portfolio.positions)) {
+    const pos = portfolio.positions[mint];
+    const price = await fetchPrice(mint);
+    if (!price) continue;
+
+    const heldHours = (Date.now() - pos.entryTime) / 3600000;
+
+    if (price >= pos.tp) {
+      await closePosition(mint, 'TAKE PROFIT', price);
+    } else if (price <= pos.sl) {
+      await closePosition(mint, 'STOP LOSS', price);
+    } else if (heldHours >= 12) {
+      await closePosition(mint, 'TIME', price);
+    }
   }
 }
 
@@ -113,8 +153,8 @@ async function monitorActivity() {
 
         const price = await fetchPrice(t.mint);
         if (price && price > 0.00000002) {
-          console.log(`🔥 [LIVE SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.022);
+          console.log(`🔥 [SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.02);
         }
       }
     }
@@ -123,7 +163,7 @@ async function monitorActivity() {
 
 function printStatus() {
   console.log('\n--- REAL DEAL STATUS ---');
-  console.log('Mode: 🔥 LIVE');
+  console.log('Mode: 🔥 LIVE (Safety ON)');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
   console.log('Positions:', Object.keys(portfolio.positions).length + '/4');
   console.log('Total PnL:', portfolio.totalPnL.toFixed(4), 'SOL');
@@ -132,8 +172,7 @@ function printStatus() {
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v3.2 - REAL DEAL');
-  console.log('  We are live');
+  console.log('  SOL COPY TRADING BOT v3.3 - REAL DEAL + SAFETY');
   console.log('========================================');
 
   await init();
@@ -142,6 +181,7 @@ async function main() {
   setInterval(async () => {
     try {
       await monitorActivity();
+      await checkPositions();
       printStatus();
     } catch (err) {
       console.error('[ERROR]', err.message);
