@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v2.4 - SMART PROFIT HUNTER
+// SOL COPY TRADING BOT v2.5 - MAX POWER MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -8,15 +8,26 @@ const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = process.env.PAPER_MODE !== 'false';
 
-const TAKE_PROFIT = 4.0;
-const STOP_LOSS = -0.65;
-const MAX_POSITION_PCT = 0.35;
-const MAX_POSITIONS = 3;
-const INTERVAL_MS = 75000;
+const TAKE_PROFIT = 5.0;           // Higher reward target
+const STOP_LOSS = -0.75;
+const MAX_POSITION_PCT = 0.40;     // More aggressive sizing
+const MAX_POSITIONS = 4;
+const INTERVAL_MS = 55000;         // Faster but controlled
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
-const SLIPPAGE_BPS = 4000;
+const SLIPPAGE_BPS = 4500;
 
-const WHALE_WALLETS = [ /* your 10 wallets */ ];
+const WHALE_WALLETS = [
+  'AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm',
+  '4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t',
+  '8zFZHuSRuDpuAR7J6FzwyF3vKNx4CVW3DFHJerQhc7Zd',
+  'H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM',
+  '66T8MTwrfmsQav459F324wttiGLiFQ15J4jjhAfNCSuK',
+  'DfMxre4cKmvogbLrPigxmibVTTQDuzjdXojWzjCXXhzj',
+  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+  'Ai4zVFBhbnJ3SUYn2F3PMo2NZcuPJJYfSeY3Bv6Y4Bfz',
+  'TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM',
+  'JD4gme11MfBkNdKHBGEAKkEcoBNJ1oD7pYfaTTqUXY3E',
+];
 
 const portfolio = { balance: 0, positions: {}, trades: [], totalPnL: 0 };
 let connection, keypair, lastKnownOnChainBalance = 0;
@@ -42,10 +53,10 @@ async function init() {
   lastKnownOnChainBalance = portfolio.balance;
 
   if (PAPER_MODE) {
-    console.log('📝 PAPER MODE - Smart Training');
+    console.log('📝 PAPER MODE - MAX POWER TRAINING');
   } else {
     keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-    console.log('🔥 LIVE MICRO MODE');
+    console.log('🔥🔥 LIVE MAX POWER MODE');
   }
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
@@ -57,21 +68,13 @@ async function fetchPrice(mint) {
   return data?.data?.value || null;
 }
 
-async function isPromisingToken(mint) {
-  const price = await fetchPrice(mint);
-  if (!price || price < 0.000001) return false;
-  // Could add more checks (volume, age, etc.) later
-  return true;
-}
-
 async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.015);
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.018);
   let invest = Math.min(solAmount, maxSol);
   if (invest < 0.004 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
   if (!PAPER_MODE) {
-    console.log(`[LIVE BUY] ${symbol}`);
-    // executeSwap would go here
+    console.log(`[LIVE BUY] Attempting ${invest.toFixed(4)} SOL on ${symbol}`);
   } else {
     portfolio.balance -= invest;
   }
@@ -81,13 +84,13 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
     entryTime: Date.now(), tp: entryPrice * TAKE_PROFIT, sl: entryPrice * (1 + STOP_LOSS)
   };
 
-  console.log(`🚀 [${PAPER_MODE ? 'PAPER' : 'LIVE'} BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
+  console.log(`🚀🚀 [${PAPER_MODE ? 'PAPER' : 'LIVE'} POWER BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
 }
 
 async function monitorWhales() {
-  console.log(`🔍 [SMART SCAN] Checking whales + momentum...`);
+  console.log(`🔥 [MAX POWER SCAN] Hunting for winners...`);
   for (const whale of WHALE_WALLETS) {
-    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=15`) || [];
+    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=20`) || [];
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
@@ -99,9 +102,9 @@ async function monitorWhales() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && await isPromisingToken(t.mint)) {
-          console.log(`🔥 [WHALE + MOMENTUM] ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.012);
+        if (price && price > 0.00000005) {
+          console.log(`🔥🔥🔥 [HOT POWER SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.016);
         }
       }
     }
@@ -109,17 +112,18 @@ async function monitorWhales() {
 }
 
 function printStatus() {
-  console.log('\n--- SMART STATUS ---');
-  console.log('Mode:', PAPER_MODE ? '📝 PAPER' : '🔥 LIVE');
+  console.log('\n--- MAX POWER STATUS ---');
+  console.log('Mode:', PAPER_MODE ? '📝 PAPER' : '🔥 LIVE POWER');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
-  console.log('Positions:', Object.keys(portfolio.positions).length + '/3');
+  console.log('Positions:', Object.keys(portfolio.positions).length + '/4');
   console.log('Total PnL:', portfolio.totalPnL.toFixed(4), 'SOL');
   console.log('--------------\n');
 }
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v2.4 - SMART PROFIT HUNTER');
+  console.log('  SOL COPY TRADING BOT v2.5 - MAX POWER MODE');
+  console.log('  We have the power - Let\'s go!');
   console.log('========================================');
 
   await init();
@@ -135,6 +139,6 @@ async function main() {
   }, INTERVAL_MS);
 }
 
-setInterval(() => console.log(`[ALIVE] ${new Date().toLocaleTimeString()}`), 30000);
+setInterval(() => console.log(`[ALIVE] ${new Date().toLocaleTimeString()}`), 25000);
 
 main().catch(err => console.error('Fatal:', err.message));
