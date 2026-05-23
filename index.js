@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v2.9 - INDEPENDENT HUNTER
+// SOL COPY TRADING BOT v3.0 - EFFICIENT HUNTER
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -12,11 +12,22 @@ const TAKE_PROFIT = 5.0;
 const STOP_LOSS = -0.80;
 const MAX_POSITION_PCT = 0.50;
 const MAX_POSITIONS = 4;
-const INTERVAL_MS = 45000;
+const INTERVAL_MS = 90000;        // 90 seconds - much gentler
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
 const SLIPPAGE_BPS = 5500;
 
-const WHALE_WALLETS = [ /* your 10 wallets */ ];
+const WHALE_WALLETS = [
+  'AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm',
+  '4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t',
+  '8zFZHuSRuDpuAR7J6FzwyF3vKNx4CVW3DFHJerQhc7Zd',
+  'H72yLkhTnoBfhBTXXaj1RBXuirm8s8G5fcVh2XpQLggM',
+  '66T8MTwrfmsQav459F324wttiGLiFQ15J4jjhAfNCSuK',
+  'DfMxre4cKmvogbLrPigxmibVTTQDuzjdXojWzjCXXhzj',
+  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+  'Ai4zVFBhbnJ3SUYn2F3PMo2NZcuPJJYfSeY3Bv6Y4Bfz',
+  'TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM',
+  'JD4gme11MfBkNdKHBGEAKkEcoBNJ1oD7pYfaTTqUXY3E',
+];
 
 const portfolio = { balance: 0, positions: {}, trades: [], totalPnL: 0 };
 let connection, keypair, lastKnownOnChainBalance = 0;
@@ -40,7 +51,7 @@ async function init() {
   const lamports = await connection.getBalance(pubkey);
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
 
-  console.log(PAPER_MODE ? '📝 PAPER MODE - INDEPENDENT HUNTER' : '🔥 LIVE INDEPENDENT MODE');
+  console.log(PAPER_MODE ? '📝 PAPER MODE - EFFICIENT HUNTER' : '🔥 LIVE EFFICIENT MODE');
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -63,13 +74,13 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
   }
 
   portfolio.positions[mint] = { symbol, entryPrice, tokens: invest/entryPrice, invested: invest, entryTime: Date.now() };
-  console.log(`🚀🚀 [${PAPER_MODE ? 'PAPER' : 'LIVE'} INDEPENDENT BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
+  console.log(`🚀 [${PAPER_MODE ? 'PAPER' : 'LIVE'} BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
 }
 
 async function monitorWhales() {
-  console.log(`🔥 [INDEPENDENT SCAN] Hunting winners...`);
+  console.log(`🔥 [EFFICIENT HUNTER SCAN] Looking for winners...`);
   for (const whale of WHALE_WALLETS) {
-    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=25`) || [];
+    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=15`) || [];
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
@@ -82,7 +93,7 @@ async function monitorWhales() {
 
         const price = await fetchPrice(t.mint);
         if (price && price > 0.00000002) {
-          console.log(`🔥 [WHALE SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
+          console.log(`🔥 [STRONG SIGNAL] ${whale.slice(0,8)}... → ${t.mint.slice(0,8)}... @ ${price}`);
           await openPosition(t.mint, t.mint.slice(0,8), price, 0.02);
         }
       }
@@ -90,16 +101,8 @@ async function monitorWhales() {
   }
 }
 
-// New: Independent momentum scan (basic version)
-async function independentScan() {
-  console.log(`🧠 [SELF SCAN] Looking for rising tokens...`);
-  // For now we use whale activity as main source.
-  // In future versions we can add new token discovery.
-  await monitorWhales(); // Combine both for now
-}
-
 function printStatus() {
-  console.log('\n--- INDEPENDENT HUNTER STATUS ---');
+  console.log('\n--- EFFICIENT HUNTER STATUS ---');
   console.log('Mode:', PAPER_MODE ? '📝 PAPER' : '🔥 LIVE');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
   console.log('Positions:', Object.keys(portfolio.positions).length + '/4');
@@ -109,8 +112,8 @@ function printStatus() {
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v2.9 - INDEPENDENT HUNTER');
-  console.log('  Detecting our own profitable trades');
+  console.log('  SOL COPY TRADING BOT v3.0 - EFFICIENT HUNTER');
+  console.log('  Smart & Sustainable');
   console.log('========================================');
 
   await init();
@@ -118,7 +121,7 @@ async function main() {
 
   setInterval(async () => {
     try {
-      await independentScan();
+      await monitorWhales();
       printStatus();
     } catch (err) {
       console.error('[ERROR]', err.message);
@@ -126,6 +129,6 @@ async function main() {
   }, INTERVAL_MS);
 }
 
-setInterval(() => console.log(`[ALIVE] ${new Date().toLocaleTimeString()}`), 25000);
+setInterval(() => console.log(`[ALIVE] ${new Date().toLocaleTimeString()}`), 30000);
 
 main().catch(err => console.error('Fatal:', err.message));
