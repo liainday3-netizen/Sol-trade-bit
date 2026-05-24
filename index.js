@@ -3,8 +3,8 @@ import bs58 from 'bs58';
 import fs from 'fs';
 
 // ── ENV ──────────────────────────────────────────────────────
-const HELIUS_KEY  = process.env.HELIUS_KEY  || '';
-const BIRDEYE_KEY = process.env.BIRDEYE_KEY || '';
+const HELIUS_KEY  = process.env.HELIUS_API_KEY || '';
+const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET      = process.env.WALLET_ADDRESS || '';
 const PRIVATE_KEY = process.env.PRIVATE_KEY   || '';   // only needed for LIVE
 
