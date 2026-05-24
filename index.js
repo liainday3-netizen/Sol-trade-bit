@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v4.0 - NEW MOMENTUM HUNTER
+// SOL COPY TRADING BOT v3.5 - BALANCED MOVEMENT MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -6,15 +6,17 @@ const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
-const PAPER_MODE = true;   // Change to false when ready for real
+const PAPER_MODE = false;   // REAL DEAL
 
 const TAKE_PROFIT = 5.0;
-const STOP_LOSS = -0.75;
-const MAX_POSITION_PCT = 0.40;
-const MAX_POSITIONS = 4;
-const INTERVAL_MS = 65000;
+const STOP_LOSS = -0.70;
+const MAX_POSITION_PCT = 0.35;
+const MAX_POSITIONS = 3;
+const INTERVAL_MS = 55000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
 const SLIPPAGE_BPS = 5500;
+
+const WHALE_WALLETS = [ /* your 10 wallets */ ];
 
 const portfolio = { balance: 0, positions: {}, trades: [], totalPnL: 0 };
 let connection, keypair, lastKnownOnChainBalance = 0;
@@ -38,12 +40,9 @@ async function init() {
   const lamports = await connection.getBalance(pubkey);
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
 
-  if (!PAPER_MODE) {
-    keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-    console.log('🔥 LIVE - NEW MOMENTUM HUNTER');
-  } else {
-    console.log('📝 PAPER MODE - NEW MOMENTUM HUNTER');
-  }
+  keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+  console.log('🔥 BALANCED MOVEMENT MODE - Real Deal');
+  console.log('🛡️ Safety: Stop Loss -70% | Max 3 positions');
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -54,33 +53,85 @@ async function fetchPrice(mint) {
   return data?.data?.value || null;
 }
 
+async function executeSwap(inputMint, outputMint, amountLamports) {
+  try {
+    const quote = await safeFetch(`https://quote-api.jup.ag/v6/quote?inputMint=\( {inputMint}&outputMint= \){outputMint}&amount=\( {amountLamports}&slippageBps= \){SLIPPAGE_BPS}`);
+    if (!quote) return null;
+
+    const swapData = await safeFetch('https://quote-api.jup.ag/v6/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: WALLET,
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: 90000,
+      })
+    });
+
+    if (!swapData?.swapTransaction) return null;
+
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
+    tx.sign([keypair]);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
+    console.log('✅ [SWAP]', sig.slice(0,12)+'...');
+    return sig;
+  } catch (e) {
+    console.error('❌ [SWAP ERROR]', e.message);
+    return null;
+  }
+}
+
 async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.022);
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.018);
   let invest = Math.min(solAmount, maxSol);
   if (invest < 0.003 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
-  if (!PAPER_MODE) {
-    console.log(`[LIVE BUY] ${symbol}`);
-    // executeSwap would go here
-  } else {
-    portfolio.balance -= invest;
-  }
+  const sig = await executeSwap(SOL_MINT, mint, Math.floor(invest * LAMPORTS_PER_SOL));
+  if (!sig) return;
 
-  portfolio.positions[mint] = { symbol, entryPrice, tokens: invest/entryPrice, invested: invest, entryTime: Date.now() };
-  console.log(`🚀 [${PAPER_MODE ? 'PAPER' : 'LIVE'} MOMENTUM BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
+  portfolio.balance -= invest;
+
+  portfolio.positions[mint] = {
+    symbol, entryPrice, tokens: invest / entryPrice, invested: invest,
+    entryTime: Date.now(), tp: entryPrice * TAKE_PROFIT, sl: entryPrice * (1 + STOP_LOSS)
+  };
+
+  console.log(`🚀 [LIVE BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
 }
 
-async function monitorMomentum() {
-  console.log(`🔥 [NEW MOMENTUM SCAN] Searching for opportunities...`);
+async function closePosition(mint, reason, exitPrice) {
+  const pos = portfolio.positions[mint];
+  if (!pos) return;
 
-  // Watch key whales for signals
-  for (const whale of [
-    'AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm',
-    '4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t',
-    '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
-    '66T8MTwrfmsQav459F324wttiGLiFQ15J4jjhAfNCSuK'
-  ]) {
-    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=20`) || [];
+  const pnl = (pos.tokens * exitPrice) - pos.invested;
+  portfolio.totalPnL += pnl;
+  delete portfolio.positions[mint];
+
+  const tag = pnl > 0 ? '✅ PROFIT' : '❌ LOSS';
+  console.log(`\( {tag} [ \){reason}] ${pos.symbol} | PnL: ${pnl.toFixed(4)} SOL`);
+}
+
+async function checkPositions() {
+  for (const mint of Object.keys(portfolio.positions)) {
+    const pos = portfolio.positions[mint];
+    const price = await fetchPrice(mint);
+    if (!price) continue;
+
+    const heldHours = (Date.now() - pos.entryTime) / 3600000;
+
+    if (price >= pos.tp) await closePosition(mint, 'TP', price);
+    else if (price <= pos.sl) await closePosition(mint, 'STOP LOSS', price);
+    else if (heldHours >= 10) await closePosition(mint, 'TIME', price);
+  }
+}
+
+async function monitorActivity() {
+  console.log(`🔥 [BALANCED SCAN] Looking for opportunities...`);
+  for (const whale of WHALE_WALLETS) {
+    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=22`) || [];
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
@@ -92,9 +143,9 @@ async function monitorMomentum() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && price > 0.00000005) {
-          console.log(`🔥 [MOMENTUM SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.018);
+        if (price && price > 0.00000003) {
+          console.log(`🔥 [SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.016);
         }
       }
     }
@@ -102,18 +153,17 @@ async function monitorMomentum() {
 }
 
 function printStatus() {
-  console.log('\n--- NEW MOMENTUM STATUS ---');
-  console.log('Mode:', PAPER_MODE ? '📝 PAPER' : '🔥 LIVE');
+  console.log('\n--- BALANCED SAFETY STATUS ---');
+  console.log('Mode: 🔥 LIVE');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
-  console.log('Positions:', Object.keys(portfolio.positions).length + '/4');
+  console.log('Positions:', Object.keys(portfolio.positions).length + '/3');
   console.log('Total PnL:', portfolio.totalPnL.toFixed(4), 'SOL');
   console.log('--------------\n');
 }
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v4.0 - NEW MOMENTUM HUNTER');
-  console.log('  Fresh Start');
+  console.log('  SOL COPY TRADING BOT v3.5 - BALANCED MOVEMENT');
   console.log('========================================');
 
   await init();
@@ -121,7 +171,8 @@ async function main() {
 
   setInterval(async () => {
     try {
-      await monitorMomentum();
+      await monitorActivity();
+      await checkPositions();
       printStatus();
     } catch (err) {
       console.error('[ERROR]', err.message);
