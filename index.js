@@ -334,8 +334,8 @@ async function monitorCopyWallets(connection) {
 
         const age = Date.now() - (sig.blockTime * 1000);
 
-        // Only act on transactions from the last 2 minutes
-        if (age < 120000) {
+        // Only act on transactions from the last 5 minutes
+        if (age < 300000) {
           console.log(`👀 COPY SIGNAL: ${walletAddr.slice(0, 8)}... traded ${Math.round(age / 1000)}s ago`);
           console.log(`   └─ TX: https://solscan.io/tx/${sig.signature}`);
 
@@ -370,9 +370,16 @@ async function monitorCopyWallets(connection) {
                     const liquidity = info?.liquidity || 0;
 
                     // Safety checks before copying
-                    if (liquidity < 5000) {
-                      console.log(`   ⚠️  Skipping ${symbol} — liquidity too low ($${liquidity})`);
+                    // KOL-validated: if Birdeye returns $0 (unindexed), trust the KOL
+                    // Only hard-skip if Birdeye confirms liquidity exists but is dangerously low
+                    if (liquidity > 0 && liquidity < 1000) {
+                      console.log(`   ⚠️  Skipping ${symbol} — confirmed low liquidity (${liquidity})`);
                       continue;
+                    }
+
+                    // If liquidity is $0 (unindexed) — KOL bought it, so we trust their DD
+                    if (liquidity === 0) {
+                      console.log(`   ℹ️  ${symbol} — no Birdeye data yet, trusting KOL signal`);
                     }
 
                     const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
