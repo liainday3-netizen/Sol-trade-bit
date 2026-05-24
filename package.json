@@ -1,3 +1,12 @@
-"scripts": {
-  "start": "node sol-copy-bot-v5.mjs"
+{
+  "name": "sol-copy-trading-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^5.0.0"
+  }
 }
