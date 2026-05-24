@@ -1,13 +1,13 @@
 {
-  "name": "sol-copy-trading-bot",
-  "version": "4.0.0",
+  "name": "sol-trade-bit",
+  "version": "5.1.0",
   "type": "module",
   "main": "index.js",
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
     "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
