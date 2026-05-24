@@ -1,4 +1,390 @@
-            console.log(`   âš ï¸  Could not parse TX (might be non-swap)`);
+// SOL BOT v5.1 - Copy Trading + Jupiter Swap Execution + Risk Management
+import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
+
+// === CONFIG ===
+const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
+const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
+const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
+const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
+const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is set
+
+// === RISK MANAGEMENT ===
+const STOP_LOSS_PERCENT = 25;         // Sell if down 25%
+const TAKE_PROFIT_PERCENT = 100;      // Sell if up 100% (2x)
+const TRAILING_STOP_PERCENT = 15;     // Trail 15% below peak price
+const MAX_POSITION_SIZE_SOL = 0.02;   // Max SOL per trade
+const MAX_POSITIONS = 3;              // Max concurrent positions
+const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
+const SCAN_INTERVAL = 30000;          // Scan for new tokens every 30s
+const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
+const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
+
+// === SOLANA CONSTANTS ===
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
+
+// === TOP KOL WALLETS TO COPY (Verified April 2026 - MadeOnSol data) ===
+// Source: https://madeonsol.com/blog/top-solana-kol-wallets-to-copy-trade
+// IMPORTANT: Re-verify monthly at madeonsol.com/kol-tracker
+const COPY_WALLETS = [
+  // #1 Cented — +2,560 SOL (30d) | 8,691 trades | High-frequency scalper
+  'CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o',
+
+  // #6 Marcell — +573 SOL (30d) | 458 trades | Low-freq, high-conviction
+  'FixmSpsBa7ew26gWdiqpoMAgKRFgbSXFbGAgfMZw67X',
+
+  // #7 Jijo — +561 SOL (30d) | 1,133 trades | 71% win rate
+  '4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk',
+
+  // #10 Goyim — +456 SOL (30d) | 363 trades | Low-freq, high-conviction
+  'G3gZWqrYkNmYFKYCyfRCNtGuxdyuE2wiYKkZpiZn4WSS',
+];
+
+// === STATE ===
+const portfolio = { balance: 0, totalPnl: 0 };
+const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
+const tradeHistory = [];
+const seenSignatures = new Set();
+
+// === WALLET KEYPAIR (for live trading) ===
+let keypair = null;
+if (PRIVATE_KEY) {
+  try {
+    keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+    console.log('🔑 Wallet keypair loaded for LIVE trading');
+  } catch (e) {
+    console.error('❌ Invalid private key! Falling back to paper mode');
+  }
+}
+
+// === HELPERS ===
+async function safeFetch(url, options = {}) {
+  try {
+    const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function logTrade(action, token, price, pnlPercent = null) {
+  const time = new Date().toLocaleTimeString();
+  const pnlStr = pnlPercent !== null ? ` (${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)` : '';
+  const mode = PAPER_MODE ? '[PAPER]' : '[LIVE]';
+  console.log(`${mode} [${time}] ${action} ${token} @ $${price.toFixed(6)}${pnlStr}`);
+  tradeHistory.push({ time, action, token, price, pnlPercent, mode });
+}
+
+// === PRICE FETCHING ===
+async function getTokenPrice(mintAddress) {
+  const data = await safeFetch(
+    `https://public-api.birdeye.so/defi/price?address=${mintAddress}`,
+    { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+  );
+  return data?.data?.value || null;
+}
+
+async function getTokenInfo(mintAddress) {
+  const data = await safeFetch(
+    `https://public-api.birdeye.so/defi/token_overview?address=${mintAddress}`,
+    { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+  );
+  return data?.data || null;
+}
+
+// ══════════════════════════════════════════════════════════════
+// === JUPITER SWAP ENGINE (Core live trading logic) ===
+// ══════════════════════════════════════════════════════════════
+
+async function getJupiterQuote(inputMint, outputMint, amountLamports) {
+  const params = new URLSearchParams({
+    inputMint,
+    outputMint,
+    amount: amountLamports.toString(),
+    slippageBps: SLIPPAGE_BPS.toString(),
+    onlyDirectRoutes: 'false',
+    asLegacyTransaction: 'false',
+  });
+
+  const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
+  if (!quote) {
+    console.log('   ❌ Jupiter quote failed');
+    return null;
+  }
+  return quote;
+}
+
+async function executeJupiterSwap(connection, quote) {
+  if (!keypair) {
+    console.log('   ❌ No keypair — cannot execute live swap');
+    return null;
+  }
+
+  // Get swap transaction from Jupiter
+  const swapResponse = await safeFetch(JUPITER_SWAP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: keypair.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+      computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
+      dynamicComputeUnitLimit: true,
+    }),
+  });
+
+  if (!swapResponse?.swapTransaction) {
+    console.log('   ❌ Jupiter swap transaction build failed');
+    return null;
+  }
+
+  try {
+    // Deserialize, sign, and send
+    const txBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
+    const transaction = VersionedTransaction.deserialize(txBuf);
+    transaction.sign([keypair]);
+
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+      maxRetries: 3,
+    });
+
+    // Confirm transaction
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log(`   ❌ TX failed: ${JSON.stringify(confirmation.value.err)}`);
+      return null;
+    }
+
+    console.log(`   ✅ TX confirmed: https://solscan.io/tx/${signature}`);
+    return signature;
+  } catch (e) {
+    console.log(`   ❌ Swap execution error: ${e.message}`);
+    return null;
+  }
+}
+
+// === BUY TOKEN (Jupiter) ===
+async function buyToken(connection, tokenMint, solAmount, symbol) {
+  if (positions.size >= MAX_POSITIONS) {
+    console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
+    return false;
+  }
+  if (solAmount < 0.005) {
+    console.log(`⚠️  Trade too small (${solAmount} SOL), skipping`);
+    return false;
+  }
+
+  const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+  const price = await getTokenPrice(tokenMint);
+  if (!price) {
+    console.log(`   ❌ Cannot get price for ${symbol || tokenMint.slice(0, 8)}`);
+    return false;
+  }
+
+  if (PAPER_MODE) {
+    // Paper trade
+    const tokenAmount = solAmount / price;
+    positions.set(tokenMint, {
+      entryPrice: price,
+      highestPrice: price,
+      amount: tokenAmount,
+      solInvested: solAmount,
+      entryTime: Date.now(),
+      symbol: symbol || tokenMint.slice(0, 8),
+    });
+    portfolio.balance -= solAmount;
+    logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
+    console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | Tokens: ${tokenAmount.toFixed(2)}`);
+    return true;
+  }
+
+  // === LIVE TRADE ===
+  console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
+  const quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  if (!quote) return false;
+
+  const expectedOut = parseInt(quote.outAmount);
+  console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
+
+  const signature = await executeJupiterSwap(connection, quote);
+  if (!signature) return false;
+
+  // Record position
+  const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 9)); // Adjust decimals
+  positions.set(tokenMint, {
+    entryPrice: price,
+    highestPrice: price,
+    amount: tokenAmount,
+    solInvested: solAmount,
+    entryTime: Date.now(),
+    symbol: symbol || tokenMint.slice(0, 8),
+    txSignature: signature,
+  });
+  portfolio.balance -= solAmount;
+  logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
+  console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+  return true;
+}
+
+// === SELL TOKEN (Jupiter) ===
+async function sellToken(connection, tokenMint, reason) {
+  const position = positions.get(tokenMint);
+  if (!position) return false;
+
+  const currentPrice = await getTokenPrice(tokenMint);
+  if (!currentPrice) {
+    console.log(`   ❌ Cannot get price for sell of ${position.symbol}`);
+    return false;
+  }
+
+  const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+
+  if (PAPER_MODE) {
+    // Paper sell
+    const currentValue = position.amount * currentPrice;
+    const pnlSol = currentValue - position.solInvested;
+    portfolio.balance += position.solInvested + pnlSol;
+    portfolio.totalPnl += pnlSol;
+    positions.delete(tokenMint);
+    logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
+    console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
+    return true;
+  }
+
+  // === LIVE SELL ===
+  // Sell all tokens back to SOL
+  const tokenInfo = await getTokenInfo(tokenMint);
+  const decimals = tokenInfo?.decimals || 9;
+  const amountRaw = Math.floor(position.amount * (10 ** decimals));
+
+  console.log(`🔄 Getting Jupiter quote: ${position.symbol} → SOL (${reason})`);
+  const quote = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw);
+  if (!quote) {
+    console.log(`   ❌ Quote failed for sell — will retry next cycle`);
+    return false;
+  }
+
+  const expectedSolBack = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+  console.log(`   📊 Quote: ${expectedSolBack.toFixed(4)} SOL back`);
+
+  const signature = await executeJupiterSwap(connection, quote);
+  if (!signature) return false;
+
+  // Update portfolio
+  const pnlSol = expectedSolBack - position.solInvested;
+  portfolio.balance += expectedSolBack;
+  portfolio.totalPnl += pnlSol;
+  positions.delete(tokenMint);
+
+  logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
+  console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+  return true;
+}
+
+// === RISK MANAGEMENT ENGINE ===
+function evaluatePosition(tokenMint, currentPrice) {
+  const position = positions.get(tokenMint);
+  if (!position) return 'NO_POSITION';
+
+  const { entryPrice, highestPrice } = position;
+  const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+  // Update highest price for trailing stop
+  if (currentPrice > highestPrice) {
+    position.highestPrice = currentPrice;
+  }
+
+  // HARD STOP-LOSS
+  if (pnlPercent <= -STOP_LOSS_PERCENT) {
+    return { action: 'SELL', reason: '🔴 STOP LOSS', pnlPercent };
+  }
+
+  // TAKE PROFIT
+  if (pnlPercent >= TAKE_PROFIT_PERCENT) {
+    return { action: 'SELL', reason: '🟢 TAKE PROFIT', pnlPercent };
+  }
+
+  // TRAILING STOP (only activate after 10% gain)
+  if (pnlPercent > 10) {
+    const dropFromPeak = ((position.highestPrice - currentPrice) / position.highestPrice) * 100;
+    if (dropFromPeak >= TRAILING_STOP_PERCENT) {
+      return { action: 'SELL', reason: '🟡 TRAILING STOP', pnlPercent };
+    }
+  }
+
+  return { action: 'HOLD', reason: '⏳ HOLDING', pnlPercent };
+}
+
+// === WALLET MONITORING (Copy Trading Core) ===
+async function monitorCopyWallets(connection) {
+  if (COPY_WALLETS.length === 0) return;
+
+  for (const walletAddr of COPY_WALLETS) {
+    try {
+      const pubkey = new PublicKey(walletAddr);
+      const signatures = await connection.getSignaturesForAddress(pubkey, { limit: 5 });
+
+      for (const sig of signatures) {
+        if (seenSignatures.has(sig.signature)) continue;
+        seenSignatures.add(sig.signature);
+
+        const age = Date.now() - (sig.blockTime * 1000);
+
+        // Only act on transactions from the last 2 minutes
+        if (age < 120000) {
+          console.log(`👀 COPY SIGNAL: ${walletAddr.slice(0, 8)}... traded ${Math.round(age / 1000)}s ago`);
+          console.log(`   └─ TX: https://solscan.io/tx/${sig.signature}`);
+
+          // Parse the transaction to find what they bought
+          try {
+            const txDetail = await connection.getParsedTransaction(sig.signature, {
+              maxSupportedTransactionVersion: 0,
+            });
+
+            if (txDetail?.meta?.postTokenBalances && txDetail?.meta?.preTokenBalances) {
+              const pre = txDetail.meta.preTokenBalances;
+              const post = txDetail.meta.postTokenBalances;
+
+              // Find tokens that increased (= buy)
+              for (const postBal of post) {
+                if (postBal.owner !== walletAddr) continue;
+                if (postBal.mint === SOL_MINT) continue; // Skip wrapped SOL
+
+                const preBal = pre.find(p => p.mint === postBal.mint && p.owner === walletAddr);
+                const preAmount = preBal?.uiTokenAmount?.uiAmount || 0;
+                const postAmount = postBal.uiTokenAmount?.uiAmount || 0;
+
+                if (postAmount > preAmount) {
+                  // KOL bought this token!
+                  const tokenMint = postBal.mint;
+                  console.log(`   🎯 KOL BOUGHT: ${tokenMint.slice(0, 12)}...`);
+
+                  // Check if we should copy
+                  if (!positions.has(tokenMint) && positions.size < MAX_POSITIONS) {
+                    const info = await getTokenInfo(tokenMint);
+                    const symbol = info?.symbol || tokenMint.slice(0, 8);
+                    const liquidity = info?.liquidity || 0;
+
+                    // Safety checks before copying
+                    if (liquidity < 5000) {
+                      console.log(`   ⚠️  Skipping ${symbol} — liquidity too low ($${liquidity})`);
+                      continue;
+                    }
+
+                    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
+                    console.log(`   🚀 COPYING: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL`);
+                    await buyToken(connection, tokenMint, tradeSize, symbol);
+                  }
+                }
+              }
+            }
+          } catch (parseErr) {
+            // TX parsing failed — skip this one
+            console.log(`   ⚠️  Could not parse TX (might be non-swap)`);
           }
         }
       }
@@ -31,9 +417,9 @@ async function scanNewTokens() {
     });
 
     if (newFinds.length > 0) {
-      console.log(`ðŸ” Found ${newFinds.length} trending tokens`);
+      console.log(`🔍 Found ${newFinds.length} trending tokens`);
       for (const token of newFinds.slice(0, 3)) {
-        console.log(`   â””â”€ ${token.symbol || token.address.slice(0, 8)} | $${(token.price || 0).toFixed(6)} | Liq: $${(token.liquidity || 0).toLocaleString()}`);
+        console.log(`   └─ ${token.symbol || token.address.slice(0, 8)} | $${(token.price || 0).toFixed(6)} | Liq: $${(token.liquidity || 0).toLocaleString()}`);
       }
     }
   }
@@ -43,7 +429,7 @@ async function scanNewTokens() {
 async function monitorPositions(connection) {
   if (positions.size === 0) return;
 
-  console.log(`\nðŸ“Š Checking ${positions.size} position(s)...`);
+  console.log(`\n📊 Checking ${positions.size} position(s)...`);
 
   for (const [mint, position] of positions) {
     const currentPrice = await getTokenPrice(mint);
@@ -63,10 +449,10 @@ async function monitorPositions(connection) {
 
 // === STATUS DISPLAY ===
 function showStatus() {
-  console.log(`\n${'â•'.repeat(50)}`);
-  console.log(`${PAPER_MODE ? 'ðŸ“ PAPER' : 'ðŸ’Ž LIVE'} | ðŸ’° ${portfolio.balance.toFixed(4)} SOL | Pos: ${positions.size}/${MAX_POSITIONS} | PnL: ${portfolio.totalPnl > 0 ? '+' : ''}${portfolio.totalPnl.toFixed(4)} SOL`);
-  console.log(`ðŸ“‹ Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size}`);
-  console.log(`${'â•'.repeat(50)}\n`);
+  console.log(`\n${'═'.repeat(50)}`);
+  console.log(`${PAPER_MODE ? '📝 PAPER' : '💎 LIVE'} | 💰 ${portfolio.balance.toFixed(4)} SOL | Pos: ${positions.size}/${MAX_POSITIONS} | PnL: ${portfolio.totalPnl > 0 ? '+' : ''}${portfolio.totalPnl.toFixed(4)} SOL`);
+  console.log(`📋 Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size}`);
+  console.log(`${'═'.repeat(50)}\n`);
 }
 
 // === MAIN ===
@@ -78,29 +464,29 @@ async function main() {
   const balance = await connection.getBalance(pubkey);
   portfolio.balance = balance / LAMPORTS_PER_SOL;
 
-  console.log('\n' + 'â•'.repeat(50));
-  console.log('ðŸš€ SOL BOT v5.1 - Copy Trading + Jupiter Execution');
-  console.log('â•'.repeat(50));
-  console.log(`${PAPER_MODE ? 'ðŸ“ PAPER MODE' : 'ðŸ’Ž LIVE MODE â€” REAL MONEY'}`);
-  console.log(`ðŸ’° Balance: ${portfolio.balance.toFixed(4)} SOL`);
-  console.log(`ðŸ›¡ï¸  Stop Loss: -${STOP_LOSS_PERCENT}% | Take Profit: +${TAKE_PROFIT_PERCENT}% | Trailing: ${TRAILING_STOP_PERCENT}%`);
-  console.log(`ðŸ“¦ Max Position: ${MAX_POSITION_SIZE_SOL} SOL | Max Positions: ${MAX_POSITIONS}`);
-  console.log(`âš¡ Slippage: ${SLIPPAGE_BPS / 100}% | Priority Fee: ${PRIORITY_FEE_LAMPORTS} lamports`);
-  console.log(`ðŸ‘€ Copy Wallets: ${COPY_WALLETS.length}`);
+  console.log('\n' + '═'.repeat(50));
+  console.log('🚀 SOL BOT v5.1 - Copy Trading + Jupiter Execution');
+  console.log('═'.repeat(50));
+  console.log(`${PAPER_MODE ? '📝 PAPER MODE' : '💎 LIVE MODE — REAL MONEY'}`);
+  console.log(`💰 Balance: ${portfolio.balance.toFixed(4)} SOL`);
+  console.log(`🛡️  Stop Loss: -${STOP_LOSS_PERCENT}% | Take Profit: +${TAKE_PROFIT_PERCENT}% | Trailing: ${TRAILING_STOP_PERCENT}%`);
+  console.log(`📦 Max Position: ${MAX_POSITION_SIZE_SOL} SOL | Max Positions: ${MAX_POSITIONS}`);
+  console.log(`⚡ Slippage: ${SLIPPAGE_BPS / 100}% | Priority Fee: ${PRIORITY_FEE_LAMPORTS} lamports`);
+  console.log(`👀 Copy Wallets: ${COPY_WALLETS.length}`);
   console.log('');
-  console.log('ðŸ“‹ TRACKING:');
+  console.log('📋 TRACKING:');
   COPY_WALLETS.forEach((w, i) => console.log(`   ${i + 1}. ${w.slice(0, 12)}...${w.slice(-8)}`));
-  console.log('â•'.repeat(50) + '\n');
+  console.log('═'.repeat(50) + '\n');
 
   if (!PAPER_MODE) {
-    console.log('âš ï¸  â•â•â• LIVE TRADING ACTIVE â€” REAL SOL AT RISK â•â•â•');
+    console.log('⚠️  ═══ LIVE TRADING ACTIVE — REAL SOL AT RISK ═══');
     console.log('');
   }
 
   // Main scanning loop
   setInterval(async () => {
     const time = new Date().toLocaleTimeString();
-    console.log(`ðŸ”¥ SCANNING... ${time}`);
+    console.log(`🔥 SCANNING... ${time}`);
 
     // 1. Check SOL price (heartbeat)
     const solPrice = await getTokenPrice(SOL_MINT);
@@ -108,7 +494,7 @@ async function main() {
       console.log(`   SOL: $${solPrice.toFixed(2)}`);
     }
 
-    // 2. Monitor copy wallets â€” parse TXs and auto-buy
+    // 2. Monitor copy wallets — parse TXs and auto-buy
     await monitorCopyWallets(connection);
 
     // 3. Scan trending tokens
