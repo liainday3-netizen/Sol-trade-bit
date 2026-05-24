@@ -1,22 +1,16 @@
 // ============================================================
 //  SOL COPY TRADING BOT v5.0 — MOMENTUM HUNTER (UPGRADED)
-//  Fixes: template-literal bug, missing TP/SL loop, no symbol
-//  resolution, unbounded Set, no swap execution, no retry logic.
-//  Adds: Jupiter swap, token metadata, momentum scoring,
-//        trailing stop, position aging, portfolio persistence,
-//        rate-limited fetch queue, graceful shutdown.
 // ============================================================
 
-import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import bs58 from 'bs58';
-import fs from 'fs';
+const { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const bs58 = require('bs58');
+const fs   = require('fs');
 
 // ── ENV ──────────────────────────────────────────────────────
 const HELIUS_KEY  = process.env.HELIUS_API_KEY  || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const PRIVATE_KEY = process.env.PRIVATE_KEY     || '';
 
-// Derive wallet from private key — no WALLET_ADDRESS variable needed
 let WALLET = '';
 if (PRIVATE_KEY) {
   try {
@@ -25,32 +19,30 @@ if (PRIVATE_KEY) {
   } catch(e) {}
 }
 
-// PAPER_MODE read from Railway env var (default true)
 const _isPaper = (process.env.PAPER_MODE || 'true').toLowerCase() !== 'false';
 
 // ── CONFIG ───────────────────────────────────────────────────
 const CFG = {
-  PAPER_MODE:          _isPaper, // set PAPER_MODE=false in Railway to go live
-  TAKE_PROFIT:         5.0,      // +500% exit
-  STOP_LOSS:          -0.75,     // -75%  exit
-  TRAILING_STOP:       0.30,     // close if peak drops 30% (after +50%)
-  MAX_POSITION_PCT:    0.20,     // 20% of balance per trade
-  MAX_SOL_PER_TRADE:   0.022,    // hard cap per trade (SOL)
-  MIN_SOL_PER_TRADE:   0.005,    // ignore anything smaller
+  PAPER_MODE:          _isPaper,
+  TAKE_PROFIT:         5.0,
+  STOP_LOSS:          -0.75,
+  TRAILING_STOP:       0.30,
+  MAX_POSITION_PCT:    0.20,
+  MAX_SOL_PER_TRADE:   0.022,
+  MIN_SOL_PER_TRADE:   0.005,
   MAX_POSITIONS:       4,
-  SCAN_INTERVAL_MS:    65_000,   // momentum scan cadence
-  MONITOR_INTERVAL_MS: 15_000,   // TP/SL check cadence
-  MAX_POSITION_AGE_H:  6,        // force-close after N hours
-  SLIPPAGE_BPS:        5_500,
+  SCAN_INTERVAL_MS:    65000,
+  MONITOR_INTERVAL_MS: 15000,
+  MAX_POSITION_AGE_H:  6,
+  SLIPPAGE_BPS:        5500,
   MIN_PRICE_USD:       0.00000005,
-  MIN_VOLUME_24H:      10_000,   // USD — filter dead tokens
-  MIN_MCAP:            50_000,   // USD — filter micro-caps
-  MOMENTUM_MIN_SCORE:  60,       // 0-100 composite score
-  PROCESSED_TX_TTL:    50_000,   // max entries in dedup set
+  MIN_VOLUME_24H:      10000,
+  MIN_MCAP:            50000,
+  MOMENTUM_MIN_SCORE:  60,
+  PROCESSED_TX_TTL:    50000,
   PORTFOLIO_FILE:      './portfolio.json',
 };
 
-// ── WHALES ───────────────────────────────────────────────────
 const WHALES = [
   'AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm',
   '4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t',
@@ -58,18 +50,13 @@ const WHALES = [
   '66T8MTwrfmsQav459F324wttiGLiFQ15J4jjhAfNCSuK',
 ];
 
-const SOL_MINT    = 'So11111111111111111111111111111111111111111112';
+const SOL_MINT     = 'So11111111111111111111111111111111111111111112';
 const JUPITER_QUOTE = 'https://quote-api.jup.ag/v6';
 
 // ── STATE ────────────────────────────────────────────────────
 let connection, keypair;
 const processedTxs = new Map();
-let portfolio = {
-  balance: 0,
-  positions: {},
-  trades: [],
-  totalPnL: 0,
-};
+let portfolio = { balance: 0, positions: {}, trades: [], totalPnL: 0 };
 
 // ── PORTFOLIO PERSISTENCE ─────────────────────────────────────
 function savePortfolio() {
@@ -86,22 +73,18 @@ function loadPortfolio() {
       portfolio.totalPnL  = saved.totalPnL  || 0;
       log('info', `Loaded ${Object.keys(portfolio.positions).length} open positions from disk`);
     }
-  } catch (e) {
-    log('warn', 'Could not load portfolio file:', e.message);
-  }
+  } catch (e) { log('warn', 'Could not load portfolio:', e.message); }
 }
 
 // ── LOGGER ───────────────────────────────────────────────────
 const ICONS = { info: 'ℹ️ ', warn: '⚠️ ', error: '❌', trade: '💰', signal: '🔥', ok: '✅' };
 function log(level, ...args) {
-  const ts = new Date().toLocaleTimeString();
-  console.log(`[${ts}] ${ICONS[level] ?? ''}`, ...args);
+  console.log(`[${new Date().toLocaleTimeString()}] ${ICONS[level] ?? ''}`, ...args);
 }
 
-// ── RATE-LIMITED FETCH QUEUE ──────────────────────────────────
+// ── FETCH QUEUE ───────────────────────────────────────────────
 const _queue = [];
 let _running = 0;
-const MAX_CONCURRENT = 4;
 
 async function enqueue(fn) {
   return new Promise((resolve, reject) => {
@@ -111,22 +94,21 @@ async function enqueue(fn) {
 }
 
 function _drain() {
-  while (_running < MAX_CONCURRENT && _queue.length) {
+  while (_running < 4 && _queue.length) {
     const { fn, resolve, reject } = _queue.shift();
     _running++;
     fn().then(resolve).catch(reject).finally(() => { _running--; _drain(); });
   }
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function safeFetch(url, options = {}, retries = 3) {
   return enqueue(async () => {
     for (let i = 0; i < retries; i++) {
       try {
-        const ctrl  = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 10_000);
-        const res   = await fetch(url, { signal: ctrl.signal, ...options });
-        clearTimeout(timer);
-        if (res.status === 429) { await sleep(1_500 * (i + 1)); continue; }
+        const res = await fetch(url, options);
+        if (res.status === 429) { await sleep(1500 * (i + 1)); continue; }
         if (!res.ok) return null;
         return await res.json();
       } catch (e) {
@@ -137,8 +119,6 @@ async function safeFetch(url, options = {}, retries = 3) {
     return null;
   });
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── HELIUS ───────────────────────────────────────────────────
 async function getWhaleTxs(whale) {
@@ -167,24 +147,24 @@ async function scoreMomentum(mint) {
   const ov = await fetchTokenOverview(mint);
   if (!ov) return 0;
 
-  const price    = ov.price    ?? 0;
-  const vol24h   = ov.v24hUSD  ?? 0;
-  const mcap     = ov.mc       ?? 0;
-  const change1h = ov.priceChange1hPercent  ?? 0;
-  const change24h= ov.priceChange24hPercent ?? 0;
-  const liquidity= ov.liquidity ?? 0;
+  const price     = ov.price    ?? 0;
+  const vol24h    = ov.v24hUSD  ?? 0;
+  const mcap      = ov.mc       ?? 0;
+  const change1h  = ov.priceChange1hPercent  ?? 0;
+  const change24h = ov.priceChange24hPercent ?? 0;
+  const liquidity = ov.liquidity ?? 0;
 
-  if (price   < CFG.MIN_PRICE_USD)  return 0;
-  if (vol24h  < CFG.MIN_VOLUME_24H) return 0;
-  if (mcap    < CFG.MIN_MCAP)       return 0;
+  if (price  < CFG.MIN_PRICE_USD)  return 0;
+  if (vol24h < CFG.MIN_VOLUME_24H) return 0;
+  if (mcap   < CFG.MIN_MCAP)       return 0;
 
-  const scoreVol  = Math.min(20, (vol24h   / 100_000) * 20);
-  const scoreMcap = Math.min(20, (mcap     / 500_000) * 20);
-  const score1h   = Math.min(20, Math.max(0, change1h)  / 10 * 20);
-  const score24h  = Math.min(20, Math.max(0, change24h) / 20 * 20);
-  const scoreLiq  = Math.min(20, (liquidity / 50_000)   * 20);
-
-  return Math.round(scoreVol + scoreMcap + score1h + score24h + scoreLiq);
+  return Math.round(
+    Math.min(20, (vol24h    / 100000) * 20) +
+    Math.min(20, (mcap      / 500000) * 20) +
+    Math.min(20, Math.max(0, change1h)  / 10 * 20) +
+    Math.min(20, Math.max(0, change24h) / 20 * 20) +
+    Math.min(20, (liquidity / 50000)  * 20)
+  );
 }
 
 async function fetchSymbol(mint) {
@@ -205,12 +185,10 @@ function seenTx(sig) {
 // ── JUPITER SWAP ──────────────────────────────────────────────
 async function executeSwap(inputMint, outputMint, amountLamports, slippageBps) {
   try {
-    const quoteUrl =
-      `${JUPITER_QUOTE}/quote?inputMint=${inputMint}&outputMint=${outputMint}` +
-      `&amount=${amountLamports}&slippageBps=${slippageBps}&onlyDirectRoutes=false`;
-
-    const quote = await safeFetch(quoteUrl);
-    if (!quote || quote.error) { log('warn', 'Jupiter quote failed:', quote?.error); return false; }
+    const quote = await safeFetch(
+      `${JUPITER_QUOTE}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`
+    );
+    if (!quote || quote.error) { log('warn', 'Jupiter quote failed'); return false; }
 
     const swapRes = await safeFetch(`${JUPITER_QUOTE}/swap`, {
       method: 'POST',
@@ -220,14 +198,13 @@ async function executeSwap(inputMint, outputMint, amountLamports, slippageBps) {
         userPublicKey: keypair.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 10_000,
+        prioritizationFeeLamports: 10000,
       }),
     });
     if (!swapRes?.swapTransaction) { log('warn', 'Jupiter swap build failed'); return false; }
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapRes.swapTransaction, 'base64'));
     tx.sign([keypair]);
-
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
     await connection.confirmTransaction(sig, 'confirmed');
     log('ok', `Swap confirmed: https://solscan.io/tx/${sig}`);
@@ -254,12 +231,165 @@ async function openPosition(mint, symbol, entryPrice, requestedSol) {
   portfolio.balance -= invest;
   portfolio.positions[mint] = {
     symbol, entryPrice, peakPrice: entryPrice,
-    tokens: invest / entryPrice, invested: invest,
-    entryTime: Date.now(),
+    tokens: invest / entryPrice, invested: invest, entryTime: Date.now(),
   };
 
   log('trade', `[${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} BUY] ${symbol} | ${invest.toFixed(4)} SOL @ $${entryPrice.toExponential(3)}`);
   savePortfolio();
 }
 
-// ── CLOS
+// ── CLOSE POSITION ────────────────────────────────────────────
+async function closePosition(mint, currentPrice, reason) {
+  const pos = portfolio.positions[mint];
+  if (!pos) return;
+
+  const pnlSol = pos.tokens * currentPrice - pos.invested;
+  const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+
+  if (!CFG.PAPER_MODE) {
+    await executeSwap(mint, SOL_MINT, Math.round(pos.tokens * 1e6), CFG.SLIPPAGE_BPS);
+  } else {
+    portfolio.balance += pos.invested + pnlSol;
+  }
+
+  portfolio.totalPnL += pnlSol;
+  portfolio.trades.push({ ...pos, exitPrice: currentPrice, exitTime: Date.now(), pnlSol, pnlPct, reason });
+  delete portfolio.positions[mint];
+
+  log('trade', `[${CFG.PAPER_MODE ? 'PAPER' : 'LIVE'} SELL] ${pos.symbol} | ${reason} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%) ${pnlPct >= 0 ? '📈' : '📉'}`);
+  savePortfolio();
+}
+
+// ── MONITOR POSITIONS ─────────────────────────────────────────
+async function monitorPositions() {
+  const mints = Object.keys(portfolio.positions);
+  if (!mints.length) return;
+
+  await Promise.allSettled(mints.map(async (mint) => {
+    const pos = portfolio.positions[mint];
+    if (!pos) return;
+
+    const price = await fetchPrice(mint);
+    if (!price || price <= 0) return;
+
+    if (price > pos.peakPrice) pos.peakPrice = price;
+
+    const pnlPct    = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+    const trailDrop = ((pos.peakPrice - price)  / pos.peakPrice)  * 100;
+    const ageH      = (Date.now() - pos.entryTime) / 3600000;
+
+    if (pnlPct >= CFG.TAKE_PROFIT * 100)                     { await closePosition(mint, price, 'TAKE_PROFIT');   return; }
+    if (pnlPct <= CFG.STOP_LOSS   * 100)                     { await closePosition(mint, price, 'STOP_LOSS');     return; }
+    if (pnlPct > 50 && trailDrop >= CFG.TRAILING_STOP * 100) { await closePosition(mint, price, 'TRAILING_STOP'); return; }
+    if (ageH   >= CFG.MAX_POSITION_AGE_H)                    { await closePosition(mint, price, 'MAX_AGE');       return; }
+
+    log('info', `  ${pos.symbol} | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% | peak: $${pos.peakPrice.toExponential(3)}`);
+  }));
+}
+
+// ── MOMENTUM SCANNER ──────────────────────────────────────────
+async function monitorMomentum() {
+  log('signal', `[MOMENTUM SCAN] Watching ${WHALES.length} whales...`);
+
+  for (const whale of WHALES) {
+    const txs = await getWhaleTxs(whale);
+    for (const tx of txs) {
+      if (!tx?.signature || seenTx(tx.signature)) continue;
+
+      const isSwap = tx.type === 'SWAP' || tx.description?.toLowerCase().includes('swap');
+      if (!isSwap) continue;
+
+      for (const t of (tx.tokenTransfers || [])) {
+        if (t.toUserAccount !== whale)  continue;
+        if (t.mint === SOL_MINT)         continue;
+        if (portfolio.positions[t.mint]) continue;
+
+        const score = await scoreMomentum(t.mint);
+        if (score < CFG.MOMENTUM_MIN_SCORE) {
+          log('info', `  Skip ${t.mint.slice(0,8)} — score ${score}/100`);
+          continue;
+        }
+
+        const symbol = await fetchSymbol(t.mint);
+        const price  = await fetchPrice(t.mint);
+        if (!price || price <= 0) continue;
+
+        log('signal', `[SIGNAL] ${symbol} | score ${score}/100 @ $${price.toExponential(3)}`);
+        await openPosition(t.mint, symbol, price, CFG.MAX_SOL_PER_TRADE);
+      }
+    }
+  }
+}
+
+// ── STATUS ────────────────────────────────────────────────────
+async function printStatus() {
+  const posCount = Object.keys(portfolio.positions).length;
+  console.log('\n══════════════════════════════════════');
+  console.log(`  SOL COPY BOT v5.0 | ${CFG.PAPER_MODE ? '📝 PAPER' : '🔥 LIVE'}`);
+  console.log('══════════════════════════════════════');
+  console.log(`  Wallet   : ${WALLET}`);
+  console.log(`  Balance  : ${portfolio.balance.toFixed(4)} SOL`);
+  console.log(`  Positions: ${posCount}/${CFG.MAX_POSITIONS}`);
+  console.log(`  Total PnL: ${portfolio.totalPnL >= 0 ? '+' : ''}${portfolio.totalPnL.toFixed(4)} SOL`);
+  console.log(`  Trades   : ${portfolio.trades.length}`);
+  if (posCount) {
+    console.log('\n  Open Positions:');
+    for (const [mint, pos] of Object.entries(portfolio.positions)) {
+      const price  = await fetchPrice(mint);
+      if (!price) { console.log(`    ${pos.symbol}: (price unavailable)`); continue; }
+      const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+      const ageH   = ((Date.now() - pos.entryTime) / 3600000).toFixed(1);
+      console.log(`    ${pos.symbol.padEnd(10)} | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% | ${ageH}h`);
+    }
+  }
+  console.log('══════════════════════════════════════\n');
+}
+
+// ── INIT ──────────────────────────────────────────────────────
+async function init() {
+  if (!HELIUS_KEY || !BIRDEYE_KEY) throw new Error('Set HELIUS_API_KEY and BIRDEYE_API_KEY env vars');
+  if (!PRIVATE_KEY)                throw new Error('Set PRIVATE_KEY env var');
+
+  connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`, 'confirmed');
+  keypair    = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
+
+  const lamports = await connection.getBalance(keypair.publicKey);
+  portfolio.balance = lamports / LAMPORTS_PER_SOL;
+
+  loadPortfolio();
+  log('ok', CFG.PAPER_MODE ? '📝 PAPER MODE' : '🔥 LIVE MODE — funds at risk');
+  log('ok', `Connected. Balance: ${portfolio.balance.toFixed(4)} SOL`);
+}
+
+// ── SHUTDOWN ──────────────────────────────────────────────────
+process.on('SIGINT',             () => { log('info', 'Shutting down…'); savePortfolio(); process.exit(0); });
+process.on('SIGTERM',            () => { log('info', 'Shutting down…'); savePortfolio(); process.exit(0); });
+process.on('uncaughtException',  e  => log('error', 'Uncaught:', e.message));
+process.on('unhandledRejection', r  => log('error', 'Rejection:', r));
+
+// ── MAIN ──────────────────────────────────────────────────────
+async function main() {
+  console.log('╔══════════════════════════════════════╗');
+  console.log('║  SOL COPY TRADING BOT v5.0           ║');
+  console.log('║  MOMENTUM HUNTER — UPGRADED          ║');
+  console.log('╚══════════════════════════════════════╝\n');
+
+  await init();
+  await printStatus();
+
+  setInterval(async () => {
+    try { await monitorPositions(); }
+    catch (e) { log('error', 'monitorPositions:', e.message); }
+  }, CFG.MONITOR_INTERVAL_MS);
+
+  const scanLoop = async () => {
+    try { await monitorMomentum(); await printStatus(); }
+    catch (e) { log('error', 'monitorMomentum:', e.message); }
+    setTimeout(scanLoop, CFG.SCAN_INTERVAL_MS);
+  };
+  setTimeout(scanLoop, 2000);
+
+  setInterval(() => log('info', `[ALIVE] ${new Date().toLocaleTimeString()}`), 60000);
+}
+
+main().catch(err => { log('error', 'Fatal:', err.message); process.exit(1); });
