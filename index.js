@@ -1,4 +1,4 @@
-// SOL COPY TRADING BOT v3.4 - TIGHT SAFETY MODE
+// SOL COPY TRADING BOT v3.5 - BALANCED MOVEMENT MODE
 import { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -8,13 +8,13 @@ const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
 const PAPER_MODE = false;   // REAL DEAL
 
-const TAKE_PROFIT = 4.5;
-const STOP_LOSS = -0.60;           // Tighter safety
-const MAX_POSITION_PCT = 0.25;     // Smaller bets
-const MAX_POSITIONS = 2;           // Max 2 positions
-const INTERVAL_MS = 80000;         // Slower scanning
+const TAKE_PROFIT = 5.0;
+const STOP_LOSS = -0.70;
+const MAX_POSITION_PCT = 0.35;
+const MAX_POSITIONS = 3;
+const INTERVAL_MS = 55000;
 const SOL_MINT = 'So11111111111111111111111111111111111111111112';
-const SLIPPAGE_BPS = 5000;
+const SLIPPAGE_BPS = 5500;
 
 const WHALE_WALLETS = [ /* your 10 wallets */ ];
 
@@ -41,8 +41,8 @@ async function init() {
   portfolio.balance = lamports / LAMPORTS_PER_SOL;
 
   keypair = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
-  console.log('🛡️ TIGHT SAFETY REAL DEAL MODE');
-  console.log('Stop Loss:', (STOP_LOSS * 100) + '% | Max 2 positions');
+  console.log('🔥 BALANCED MOVEMENT MODE - Real Deal');
+  console.log('🛡️ Safety: Stop Loss -70% | Max 3 positions');
   console.log('✅ Connected. Balance:', portfolio.balance.toFixed(4), 'SOL');
 }
 
@@ -66,7 +66,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
         userPublicKey: WALLET,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 80000,
+        prioritizationFeeLamports: 90000,
       })
     });
 
@@ -76,7 +76,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
     tx.sign([keypair]);
 
     const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
-    console.log('✅ [SAFE SWAP]', sig.slice(0,12)+'...');
+    console.log('✅ [SWAP]', sig.slice(0,12)+'...');
     return sig;
   } catch (e) {
     console.error('❌ [SWAP ERROR]', e.message);
@@ -85,7 +85,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
 }
 
 async function openPosition(mint, symbol, entryPrice, solAmount) {
-  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.015); // Very small
+  const maxSol = Math.min(portfolio.balance * MAX_POSITION_PCT, 0.018);
   let invest = Math.min(solAmount, maxSol);
   if (invest < 0.003 || Object.keys(portfolio.positions).length >= MAX_POSITIONS) return;
 
@@ -99,7 +99,7 @@ async function openPosition(mint, symbol, entryPrice, solAmount) {
     entryTime: Date.now(), tp: entryPrice * TAKE_PROFIT, sl: entryPrice * (1 + STOP_LOSS)
   };
 
-  console.log(`🛡️ [SAFE LIVE BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
+  console.log(`🚀 [LIVE BUY] ${symbol} | ${invest.toFixed(4)} SOL`);
 }
 
 async function closePosition(mint, reason, exitPrice) {
@@ -124,14 +124,14 @@ async function checkPositions() {
 
     if (price >= pos.tp) await closePosition(mint, 'TP', price);
     else if (price <= pos.sl) await closePosition(mint, 'STOP LOSS', price);
-    else if (heldHours >= 8) await closePosition(mint, 'TIME', price);
+    else if (heldHours >= 10) await closePosition(mint, 'TIME', price);
   }
 }
 
 async function monitorActivity() {
-  console.log(`🔥 [SAFE SCAN] Looking carefully...`);
+  console.log(`🔥 [BALANCED SCAN] Looking for opportunities...`);
   for (const whale of WHALE_WALLETS) {
-    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=20`) || [];
+    const txs = await safeFetch(`https://api.helius.xyz/v0/addresses/\( {whale}/transactions?api-key= \){HELIUS_KEY}&limit=22`) || [];
     for (const tx of txs) {
       if (!tx?.signature || processedTxs.has(tx.signature)) continue;
       processedTxs.add(tx.signature);
@@ -143,9 +143,9 @@ async function monitorActivity() {
         if (t.toUserAccount !== whale || t.mint === SOL_MINT || portfolio.positions[t.mint]) continue;
 
         const price = await fetchPrice(t.mint);
-        if (price && price > 0.00000005) {
-          console.log(`🛡️ [SAFE SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
-          await openPosition(t.mint, t.mint.slice(0,8), price, 0.012);
+        if (price && price > 0.00000003) {
+          console.log(`🔥 [SIGNAL] ${t.mint.slice(0,8)}... @ ${price}`);
+          await openPosition(t.mint, t.mint.slice(0,8), price, 0.016);
         }
       }
     }
@@ -153,17 +153,17 @@ async function monitorActivity() {
 }
 
 function printStatus() {
-  console.log('\n--- SAFE REAL DEAL STATUS ---');
-  console.log('Mode: 🔥 LIVE (Tight Safety)');
+  console.log('\n--- BALANCED SAFETY STATUS ---');
+  console.log('Mode: 🔥 LIVE');
   console.log('Balance:', portfolio.balance.toFixed(4), 'SOL');
-  console.log('Positions:', Object.keys(portfolio.positions).length + '/2');
+  console.log('Positions:', Object.keys(portfolio.positions).length + '/3');
   console.log('Total PnL:', portfolio.totalPnL.toFixed(4), 'SOL');
   console.log('--------------\n');
 }
 
 async function main() {
   console.log('========================================');
-  console.log('  SOL COPY TRADING BOT v3.4 - TIGHT SAFETY');
+  console.log('  SOL COPY TRADING BOT v3.5 - BALANCED MOVEMENT');
   console.log('========================================');
 
   await init();
