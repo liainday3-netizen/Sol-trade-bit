@@ -112,11 +112,22 @@ async function getTokenPrice(mintAddress) {
 
   // Fallback 3: derive price from Jupiter quote (1 SOL → token)
   try {
+    // Get SOL price from multiple sources
+    let solUsd = null;
     const solPrice = await safeFetch(
       `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
       { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
     );
-    const solUsd = solPrice?.data?.value || 85;
+    solUsd = solPrice?.data?.value;
+    if (!solUsd) {
+      const cgData = await safeFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+      solUsd = cgData?.solana?.usd;
+    }
+    if (!solUsd) {
+      const jupSol = await safeFetch(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`);
+      solUsd = jupSol?.data?.[SOL_MINT]?.price;
+    }
+    solUsd = solUsd || 85; // Last resort hardcoded fallback
     const quote = await safeFetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
     );
@@ -490,19 +501,36 @@ async function monitorCopyWallets(connection) {
 
 // === NEW TOKEN SCANNER (Independent Trading) ===
 async function scanNewTokens(connection) {
+  // Try Birdeye trending first
+  let candidates = [];
   const trending = await safeFetch(
     'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=10',
     { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
   );
 
-  if (!trending?.data?.tokens) return;
+  if (trending?.data?.tokens) {
+    candidates = trending.data.tokens.filter(t => {
+      if (positions.has(t.address)) return false;
+      if (!t.liquidity || t.liquidity < 50000) return false;
+      if (!t.price || t.price <= 0) return false;
+      return true;
+    });
+  }
 
-  const candidates = trending.data.tokens.filter(t => {
-    if (positions.has(t.address)) return false;        // Already holding
-    if (!t.liquidity || t.liquidity < 50000) return false;  // Min $50K liquidity
-    if (!t.price || t.price <= 0) return false;        // Must have price
-    return true;
-  });
+  // Fallback: DexScreener boosted tokens (no API key needed)
+  if (candidates.length === 0) {
+    const dexTrending = await safeFetch('https://api.dexscreener.com/token-boosts/latest/v1');
+    if (dexTrending && Array.isArray(dexTrending)) {
+      const solTokens = dexTrending.filter(t => t.chainId === 'solana').slice(0, 10);
+      for (const t of solTokens) {
+        if (positions.has(t.tokenAddress)) continue;
+        const info = await getTokenInfo(t.tokenAddress);
+        if (info && info.liquidity >= 50000 && info.price > 0) {
+          candidates.push({ address: t.tokenAddress, price: info.price, liquidity: info.liquidity, symbol: info.symbol });
+        }
+      }
+    }
+  }
 
   if (candidates.length === 0) return;
 
@@ -636,16 +664,28 @@ async function main() {
     const time = new Date().toLocaleTimeString();
     console.log(`🔥 SCANNING... ${time}`);
 
-    // 1. Check SOL price (heartbeat) — use Birdeye directly, not getTokenPrice
+    // 1. Check SOL price (heartbeat) — multi-source with fallback
+    let solUsdPrice = null;
+    // Try Birdeye
     const solPriceData = await safeFetch(
       `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
       { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
     );
-    const solUsdPrice = solPriceData?.data?.value;
+    solUsdPrice = solPriceData?.data?.value;
+    // Fallback: CoinGecko (no API key needed)
+    if (!solUsdPrice) {
+      const cgData = await safeFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+      solUsdPrice = cgData?.solana?.usd;
+    }
+    // Fallback: Jupiter price API
+    if (!solUsdPrice) {
+      const jupData = await safeFetch(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`);
+      solUsdPrice = jupData?.data?.[SOL_MINT]?.price;
+    }
     if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
       console.log(`   SOL: ${solUsdPrice.toFixed(2)}`);
     } else {
-      console.log(`   SOL: price unavailable (Birdeye returned ${solUsdPrice || 'null'})`);
+      console.log(`   SOL: price unavailable from all sources`);
     }
 
     // 2. Monitor copy wallets — parse TXs and auto-buy
