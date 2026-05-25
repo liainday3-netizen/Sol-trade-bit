@@ -488,25 +488,62 @@ async function monitorCopyWallets(connection) {
   }
 }
 
-// === NEW TOKEN SCANNER ===
-async function scanNewTokens() {
+// === NEW TOKEN SCANNER (Independent Trading) ===
+async function scanNewTokens(connection) {
   const trending = await safeFetch(
     'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=10',
     { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
   );
 
-  if (trending?.data?.tokens) {
-    const newFinds = trending.data.tokens.filter(t => {
-      if (positions.has(t.address)) return false;
-      if (t.liquidity && t.liquidity < 5000) return false;
-      return true;
-    });
+  if (!trending?.data?.tokens) return;
 
-    if (newFinds.length > 0) {
-      console.log(`🔍 Found ${newFinds.length} trending tokens`);
-      for (const token of newFinds.slice(0, 3)) {
-        console.log(`   └─ ${token.symbol || token.address.slice(0, 8)} | $${(token.price || 0).toFixed(6)} | Liq: $${(token.liquidity || 0).toLocaleString()}`);
-      }
+  const candidates = trending.data.tokens.filter(t => {
+    if (positions.has(t.address)) return false;        // Already holding
+    if (!t.liquidity || t.liquidity < 50000) return false;  // Min $50K liquidity
+    if (!t.price || t.price <= 0) return false;        // Must have price
+    return true;
+  });
+
+  if (candidates.length === 0) return;
+
+  console.log(`🔍 Found ${candidates.length} trending candidates (>$50K liq)`);
+
+  // Score candidates by momentum signals
+  for (const token of candidates.slice(0, 5)) {
+    const symbol = token.symbol || token.address.slice(0, 8);
+    const liq = token.liquidity || 0;
+
+    // Get detailed token info for age + volume
+    const info = await getTokenInfo(token.address);
+    if (!info) continue;
+
+    const createdAt = info.createdAt ? new Date(info.createdAt * 1000) : null;
+    const ageHours = createdAt ? (Date.now() - createdAt.getTime()) / 3600000 : 999;
+    const volume24h = info.v24hUSD || 0;
+    const priceChange = info.priceChange24hPercent || 0;
+
+    // FILTERS for independent entry:
+    // 1. Listed < 6 hours (fresh momentum, not stale)
+    // 2. Volume > $100K in 24h (active trading)
+    // 3. Price change positive (uptrend, not dumping)
+    // 4. Volume/Liquidity ratio > 2 (healthy turnover)
+    const volLiqRatio = liq > 0 ? volume24h / liq : 0;
+
+    console.log(`   └─ ${symbol} | ${token.price.toFixed(6)} | Liq: ${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: ${volume24h.toLocaleString()} | Chg: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
+
+    if (ageHours > 6) continue;           // Too old
+    if (volume24h < 100000) continue;      // Not enough volume
+    if (priceChange <= 0) continue;        // Not trending up
+    if (volLiqRatio < 2) continue;         // Low turnover
+
+    // PASSED ALL FILTERS — this is a high-quality independent signal
+    console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters!`);
+
+    if (positions.size < MAX_POSITIONS) {
+      const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.15); // Slightly smaller for independent trades
+      console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
+      const bought = await buyToken(connection, token.address, tradeSize, symbol);
+      if (bought) break; // Only one independent trade per scan cycle
     }
   }
 }
@@ -614,8 +651,8 @@ async function main() {
     // 2. Monitor copy wallets — parse TXs and auto-buy
     await monitorCopyWallets(connection);
 
-    // 3. Scan trending tokens
-    await scanNewTokens();
+    // 3. Scan trending tokens (independent trading)
+    await scanNewTokens(connection);
 
     // 4. Show status
     showStatus();
