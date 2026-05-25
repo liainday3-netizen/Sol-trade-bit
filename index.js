@@ -87,7 +87,21 @@ async function getTokenPrice(mintAddress) {
   );
   if (data?.data?.value) return data.data.value;
 
-  // Fallback: derive price from Jupiter quote (1 SOL → token)
+  // Fallback 2: DexScreener (indexes Pump.fun/Raydium pools faster)
+  try {
+    const dexData = await safeFetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`
+    );
+    if (dexData?.pairs?.length > 0) {
+      const price = parseFloat(dexData.pairs[0].priceUsd);
+      if (price > 0) {
+        console.log(`   💡 DexScreener price: ${price.toFixed(8)}`);
+        return price;
+      }
+    }
+  } catch (e) { /* dexscreener failed */ }
+
+  // Fallback 3: derive price from Jupiter quote (1 SOL → token)
   try {
     const solPrice = await safeFetch(
       `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
@@ -103,7 +117,7 @@ async function getTokenPrice(mintAddress) {
       console.log(`   💡 Jupiter price fallback: ${price.toFixed(8)}`);
       return price;
     }
-  } catch (e) { /* fallback failed */ }
+  } catch (e) { /* jupiter fallback failed */ }
 
   return null;
 }
