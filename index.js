@@ -266,14 +266,15 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
 }
 
 // === SELL TOKEN (Jupiter) ===
-async function sellToken(connection, tokenMint, reason) {
+async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const position = positions.get(tokenMint);
   if (!position) return false;
 
-  const currentPrice = await getTokenPrice(tokenMint);
+  // Use known price if provided (avoids re-fetch race condition)
+  let currentPrice = knownPrice || await getTokenPrice(tokenMint);
   if (!currentPrice) {
-    console.log(`   ❌ Cannot get price for sell of ${position.symbol}`);
-    return false;
+    console.log(`   ⚠️  Price fetch failed for sell of ${position.symbol} — using entry price as fallback`);
+    currentPrice = position.entryPrice; // Worst case: sell at entry price estimate
   }
 
   const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
@@ -498,10 +499,17 @@ async function monitorPositions(connection) {
     const result = evaluatePosition(mint, currentPrice);
     if (result === 'NO_POSITION') continue;
 
+    // Force exit after 30 minutes regardless (memecoin alpha decays fast)
+    const holdTime = Math.round((Date.now() - position.entryTime) / 60000);
+    if (holdTime > 30 && result.action !== 'SELL') {
+      console.log(`   ⏰ ${position.symbol} held ${holdTime}m — force-closing (max hold exceeded)`);
+      await sellToken(connection, mint, '⏰ MAX HOLD TIME', currentPrice);
+      continue;
+    }
+
     if (result.action === 'SELL') {
-      await sellToken(connection, mint, result.reason);
+      await sellToken(connection, mint, result.reason, currentPrice);
     } else {
-      const holdTime = Math.round((Date.now() - position.entryTime) / 60000);
       console.log(`   ${result.reason} ${position.symbol} | PnL: ${result.pnlPercent > 0 ? '+' : ''}${result.pnlPercent.toFixed(1)}% | ${holdTime}m`);
     }
   }
