@@ -19,6 +19,8 @@ const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
 const SCAN_INTERVAL = 30000;          // Scan for new tokens every 30s
 const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
 const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
+const MIN_TRADE_COOLDOWN = 120000;    // Wait 2 min between buys (avoid churn)
+const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -47,6 +49,7 @@ const portfolio = { balance: 0, totalPnl: 0 };
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
 const tradeHistory = [];
 const seenSignatures = new Set();
+let lastBuyTime = 0; // Cooldown tracker
 
 // === WALLET KEYPAIR (for live trading) ===
 let keypair = null;
@@ -212,6 +215,16 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
     console.log(`⚠️  Trade too small (${solAmount} SOL), skipping`);
     return false;
   }
+  // Cooldown: don't buy again within 2 minutes of last buy
+  if (Date.now() - lastBuyTime < MIN_TRADE_COOLDOWN) {
+    console.log(`⚠️  Cooldown active (${Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime)) / 1000)}s left), skipping`);
+    return false;
+  }
+  // Reserve: keep minimum SOL for gas
+  if (portfolio.balance - solAmount < MIN_BALANCE_RESERVE) {
+    console.log(`⚠️  Would breach reserve (${MIN_BALANCE_RESERVE} SOL), skipping buy`);
+    return false;
+  }
 
   const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
   const price = await getTokenPrice(tokenMint);
@@ -232,6 +245,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
       symbol: symbol || tokenMint.slice(0, 8),
     });
     portfolio.balance -= solAmount;
+    lastBuyTime = Date.now();
     logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
     console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | Tokens: ${tokenAmount.toFixed(2)}`);
     return true;
@@ -260,6 +274,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
     txSignature: signature,
   });
   portfolio.balance -= solAmount;
+  lastBuyTime = Date.now();
   logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
   console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
   return true;
@@ -556,10 +571,16 @@ async function main() {
     const time = new Date().toLocaleTimeString();
     console.log(`🔥 SCANNING... ${time}`);
 
-    // 1. Check SOL price (heartbeat)
-    const solPrice = await getTokenPrice(SOL_MINT);
-    if (solPrice) {
-      console.log(`   SOL: $${solPrice.toFixed(2)}`);
+    // 1. Check SOL price (heartbeat) — use Birdeye directly, not getTokenPrice
+    const solPriceData = await safeFetch(
+      `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
+      { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+    );
+    const solUsdPrice = solPriceData?.data?.value;
+    if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
+      console.log(`   SOL: ${solUsdPrice.toFixed(2)}`);
+    } else {
+      console.log(`   SOL: price unavailable (Birdeye returned ${solUsdPrice || 'null'})`);
     }
 
     // 2. Monitor copy wallets — parse TXs and auto-buy
