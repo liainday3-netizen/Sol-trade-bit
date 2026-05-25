@@ -51,6 +51,12 @@ const tradeHistory = [];
 const seenSignatures = new Set();
 let lastBuyTime = 0; // Cooldown tracker
 
+// === CONSENSUS TRACKING ===
+// Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
+const kolSignals = new Map();
+const CONSENSUS_THRESHOLD = 2;        // Require 2+ KOLs to buy same token
+const CONSENSUS_WINDOW = 300000;      // Within 5 minutes of each other
+
 // === WALLET KEYPAIR (for live trading) ===
 let keypair = null;
 if (PRIVATE_KEY) {
@@ -412,30 +418,43 @@ async function monitorCopyWallets(connection) {
                 if (postAmount > preAmount) {
                   // KOL bought this token!
                   const tokenMint = postBal.mint;
-                  console.log(`   🎯 KOL BOUGHT: ${tokenMint.slice(0, 12)}...`);
+                  console.log(`   🎯 KOL BOUGHT: ${tokenMint.slice(0, 12)}... (wallet: ${walletAddr.slice(0, 8)})`);
 
-                  // Check if we should copy
-                  if (!positions.has(tokenMint) && positions.size < MAX_POSITIONS) {
-                    const info = await getTokenInfo(tokenMint);
-                    const symbol = info?.symbol || tokenMint.slice(0, 8);
-                    const liquidity = info?.liquidity || 0;
+                  // === CONSENSUS FILTER ===
+                  // Don't buy immediately — register signal and wait for confirmation
+                  if (!kolSignals.has(tokenMint)) {
+                    kolSignals.set(tokenMint, { wallets: new Set(), firstSeen: Date.now() });
+                  }
+                  const signal = kolSignals.get(tokenMint);
+                  signal.wallets.add(walletAddr);
 
-                    // Safety checks before copying
-                    // KOL-validated: if Birdeye returns $0 (unindexed), trust the KOL
-                    // Only hard-skip if Birdeye confirms liquidity exists but is dangerously low
-                    if (liquidity > 0 && liquidity < 1000) {
-                      console.log(`   ⚠️  Skipping ${symbol} — confirmed low liquidity (${liquidity})`);
-                      continue;
+                  // Check if consensus reached
+                  if (signal.wallets.size >= CONSENSUS_THRESHOLD) {
+                    console.log(`   🔥🔥 CONSENSUS: ${signal.wallets.size} KOLs bought ${tokenMint.slice(0, 12)}! Executing copy...`);
+
+                    // Check if we should copy
+                    if (!positions.has(tokenMint) && positions.size < MAX_POSITIONS) {
+                      const info = await getTokenInfo(tokenMint);
+                      const symbol = info?.symbol || tokenMint.slice(0, 8);
+                      const liquidity = info?.liquidity || 0;
+
+                      if (liquidity > 0 && liquidity < 1000) {
+                        console.log(`   ⚠️  Skipping ${symbol} — confirmed low liquidity (${liquidity})`);
+                        kolSignals.delete(tokenMint);
+                        continue;
+                      }
+
+                      if (liquidity === 0) {
+                        console.log(`   ℹ️  ${symbol} — no Birdeye data yet, trusting multi-KOL consensus`);
+                      }
+
+                      const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
+                      console.log(`   🚀 CONSENSUS COPY: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL (${signal.wallets.size} KOLs confirmed)`);
+                      await buyToken(connection, tokenMint, tradeSize, symbol);
+                      kolSignals.delete(tokenMint); // Clear after execution
                     }
-
-                    // If liquidity is $0 (unindexed) — KOL bought it, so we trust their DD
-                    if (liquidity === 0) {
-                      console.log(`   ℹ️  ${symbol} — no Birdeye data yet, trusting KOL signal`);
-                    }
-
-                    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
-                    console.log(`   🚀 COPYING: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL`);
-                    await buyToken(connection, tokenMint, tradeSize, symbol);
+                  } else {
+                    console.log(`   ⏳ Signal registered (${signal.wallets.size}/${CONSENSUS_THRESHOLD} KOLs) — waiting for consensus...`);
                   }
                 }
               }
@@ -457,6 +476,15 @@ async function monitorCopyWallets(connection) {
     arr.splice(0, arr.length - 500);
     seenSignatures.clear();
     arr.forEach(s => seenSignatures.add(s));
+  }
+
+  // Expire stale consensus signals (older than CONSENSUS_WINDOW)
+  const now = Date.now();
+  for (const [mint, signal] of kolSignals) {
+    if (now - signal.firstSeen > CONSENSUS_WINDOW) {
+      console.log(`   🗑️  Expired signal for ${mint.slice(0, 8)} (${signal.wallets.size}/${CONSENSUS_THRESHOLD} KOLs, timed out)`);
+      kolSignals.delete(mint);
+    }
   }
 }
 
@@ -534,7 +562,7 @@ async function monitorPositions(connection) {
 function showStatus() {
   console.log(`\n${'═'.repeat(50)}`);
   console.log(`${PAPER_MODE ? '📝 PAPER' : '💎 LIVE'} | 💰 ${portfolio.balance.toFixed(4)} SOL | Pos: ${positions.size}/${MAX_POSITIONS} | PnL: ${portfolio.totalPnl > 0 ? '+' : ''}${portfolio.totalPnl.toFixed(4)} SOL`);
-  console.log(`📋 Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size}`);
+  console.log(`📋 Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size} | Pending signals: ${kolSignals.size}`);
   console.log(`${'═'.repeat(50)}\n`);
 }
 
