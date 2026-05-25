@@ -80,11 +80,32 @@ function logTrade(action, token, price, pnlPercent = null) {
 
 // === PRICE FETCHING ===
 async function getTokenPrice(mintAddress) {
+  // Try Birdeye first
   const data = await safeFetch(
     `https://public-api.birdeye.so/defi/price?address=${mintAddress}`,
     { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
   );
-  return data?.data?.value || null;
+  if (data?.data?.value) return data.data.value;
+
+  // Fallback: derive price from Jupiter quote (1 SOL → token)
+  try {
+    const solPrice = await safeFetch(
+      `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
+      { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+    );
+    const solUsd = solPrice?.data?.value || 85;
+    const quote = await safeFetch(
+      `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
+    );
+    if (quote?.outAmount) {
+      const tokensPerSol = parseInt(quote.outAmount) / (10 ** (quote.outputDecimals || 9));
+      const price = solUsd / tokensPerSol;
+      console.log(`   💡 Jupiter price fallback: ${price.toFixed(8)}`);
+      return price;
+    }
+  } catch (e) { /* fallback failed */ }
+
+  return null;
 }
 
 async function getTokenInfo(mintAddress) {
@@ -440,7 +461,25 @@ async function monitorPositions(connection) {
 
   for (const [mint, position] of positions) {
     const currentPrice = await getTokenPrice(mint);
-    if (!currentPrice) continue;
+    if (!currentPrice) {
+      // If stuck with no price for >10 minutes, force close at loss
+      const stuckMins = Math.round((Date.now() - position.entryTime) / 60000);
+      if (stuckMins > 10) {
+        console.log(`   ⚠️  ${position.symbol} — no price for ${stuckMins}m, force-closing position`);
+        if (PAPER_MODE) {
+          portfolio.balance += position.solInvested * 0.5; // Assume 50% loss
+          portfolio.totalPnl -= position.solInvested * 0.5;
+          positions.delete(mint);
+          logTrade('📕 SELL (⚠️ NO PRICE - FORCED)', position.symbol, 0, -50);
+          console.log(`   └─ Assumed -50% loss | Balance: ${portfolio.balance.toFixed(4)} SOL`);
+        } else {
+          await sellToken(connection, mint, '⚠️ NO PRICE - FORCED');
+        }
+      } else {
+        console.log(`   ⏳ ${position.symbol} — waiting for price data (${stuckMins}m)`);
+      }
+      continue;
+    }
 
     const result = evaluatePosition(mint, currentPrice);
     if (result === 'NO_POSITION') continue;
