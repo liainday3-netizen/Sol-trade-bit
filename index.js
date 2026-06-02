@@ -1,4 +1,4 @@
-// SOL BOT v6.0 ADVANCED - Copy Trading + Jupiter Swap Execution + Risk Management + AI Signal Analysis
+// SOL BOT v7.0 ADVANCED - Capital Protection + Full Scaling (Kelly/Streak/Volatility/Tiered TP) + AI Signal Analysis
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -290,6 +290,10 @@ const safetyState = {
   dailyStartTime: Date.now(),
   haltedUntil: 0,         // timestamp — circuit breaker
   tradesHalted: false,
+  // Capital protection
+  consecutiveLosses: 0,   // streak counter
+  dailyTradeCount: 0,     // buys placed today
+  softSizeMultiplier: 1.0,// 0.4–1.0 progressive loss reduction
 };
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
 const tradeHistory = [];
@@ -316,6 +320,27 @@ const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
 const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
 const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
 
+// --- CAPITAL PROTECTION ---
+const ABSOLUTE_FLOOR_SOL       = 0.04;   // Never trade if balance drops below this
+const MAX_DAILY_TRADES         = 20;     // Hard cap on buys per day
+const MAX_CONSECUTIVE_LOSSES   = 3;      // Pause 1h after N straight losses
+const MAX_CONSECUTIVE_LOSSES_HARD = 5;  // Pause 4h after N straight losses
+const STREAK_PAUSE_MS          = 1 * 60 * 60 * 1000;  // 1h streak pause
+const STREAK_PAUSE_HARD_MS     = 4 * 60 * 60 * 1000;  // 4h hard streak pause
+// Soft daily loss tiers — progressive size reduction before halt
+const SOFT_LOSS_TIER1          = 0.07;   // At  7% daily loss → 70% position size
+const SOFT_LOSS_TIER2          = 0.11;   // At 11% daily loss → 40% position size
+
+// --- FULL SCALING ---
+const KELLY_LOOKBACK_TRADES    = 25;     // Trades to use for Kelly Criterion
+const KELLY_FRACTION           = 0.40;   // Fractional Kelly (40%) for safety
+const STREAK_SCALE_PCT         = 0.15;   // ±15% per win/loss streak tier
+const VOL_HIGH_THRESHOLD       = 50;     // >50% 1h change → reduce size 25%
+const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
+// Tiered take-profit (partial sells)
+const TP_TIER1_PCT             = 75;     // Take 40% off at  +75%
+const TP_TIER2_PCT             = 125;    // Take 40% off at +125% (last 20% runs)
+
 function resetDailyCounterIfNeeded() {
   const elapsed = Date.now() - safetyState.dailyStartTime;
   if (elapsed > 24 * 60 * 60 * 1000) {
@@ -326,32 +351,78 @@ function resetDailyCounterIfNeeded() {
   }
 }
 
-function getScaledPositionSize(quantMultiplier = 1.0) {
+// --- Kelly Criterion helper ---
+function computeKellyMultiplier() {
+  if (tradeHistory.length < 5) return 1.0; // not enough data
+  const recent = tradeHistory.slice(-KELLY_LOOKBACK_TRADES);
+  const wins = recent.filter(t => t.pnlPercent > 0);
+  const losses = recent.filter(t => t.pnlPercent <= 0);
+  if (!wins.length || !losses.length) return wins.length > losses.length ? 1.2 : 0.8;
+  const W = wins.length / recent.length;
+  const avgWin  = wins.reduce((a, t) => a + t.pnlPercent, 0) / wins.length / 100;
+  const avgLoss = Math.abs(losses.reduce((a, t) => a + t.pnlPercent, 0) / losses.length / 100);
+  if (avgLoss === 0) return 1.2;
+  const R = avgWin / avgLoss;
+  const kellyFull = W - (1 - W) / R;
+  const kellyFrac = kellyFull * KELLY_FRACTION;
+  // Translate Kelly fraction into a ±multiplier: Kelly of 12% base → 1.0
+  const mult = Math.max(0.5, Math.min(1.6, 1 + (kellyFrac - BASE_RISK_PCT) / BASE_RISK_PCT));
+  console.log(`   📐 Kelly: W=${(W*100).toFixed(0)}% R=${R.toFixed(2)} frac=${(kellyFrac*100).toFixed(1)}% → mult=${mult.toFixed(2)}`);
+  return mult;
+}
+
+// --- Streak multiplier helper ---
+function computeStreakMultiplier() {
+  const losses = safetyState.consecutiveLosses;
+  if (losses >= 2) return Math.max(0.6, 1 - STREAK_SCALE_PCT * losses);
+  // Check recent wins
+  const recentFew = tradeHistory.slice(-3);
+  const winStreak = recentFew.length >= 2 && recentFew.every(t => t.pnlPercent > 0) ? recentFew.length : 0;
+  if (winStreak >= 3) return 1 + STREAK_SCALE_PCT * 2;  // +30%
+  if (winStreak >= 2) return 1 + STREAK_SCALE_PCT;       // +15%
+  return 1.0;
+}
+
+function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null) {
   resetDailyCounterIfNeeded();
 
   const bal = portfolio.balance;
   if (bal <= 0) return 0;
 
-  // Base size: 8% of current balance, scaled by quant signal quality
-  let size = bal * BASE_RISK_PCT * quantMultiplier;
+  // 1. Kelly Criterion base
+  const kellyMul   = computeKellyMultiplier();
+  // 2. Win/loss streak
+  const streakMul  = computeStreakMultiplier();
+  // 3. Soft daily loss reduction
+  const softMul    = safetyState.softSizeMultiplier;
+  // 4. Volatility adjustment
+  let volMul = 1.0;
+  if (tokenInfo?.priceChange1hPercent != null) {
+    const chg1h = Math.abs(tokenInfo.priceChange1hPercent);
+    if (chg1h > VOL_HIGH_THRESHOLD) { volMul = 0.75; }
+    else if (chg1h < VOL_LOW_THRESHOLD) { volMul = 1.10; }
+  }
 
-  // Apply hard bounds
+  // Base × all multipliers
+  let size = bal * BASE_RISK_PCT * quantMultiplier * kellyMul * streakMul * softMul * volMul;
+  console.log(`   📊 SIZE BUILD: base=${(bal*BASE_RISK_PCT).toFixed(4)} Kelly×${kellyMul.toFixed(2)} streak×${streakMul.toFixed(2)} soft×${softMul.toFixed(2)} vol×${volMul.toFixed(2)} quant×${quantMultiplier.toFixed(2)} → ${size.toFixed(4)} SOL`);
+
+  // Conservative mode: balance < 85% of start → hard clamp
+  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.85) {
+    size = Math.min(size, bal * 0.06 * quantMultiplier);
+    console.log(`   🛡️  CONSERVATIVE MODE (balance -15% from start) → capped`);
+  }
+
+  // Profit protect: balance > 200% of start → cap exposure
+  if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 2.0) {
+    size = Math.min(size, bal * 0.05 * quantMultiplier);
+    console.log(`   📈  PROFIT PROTECT (2× start) → capped at 5%`);
+  }
+
+  // Hard bounds
   size = Math.max(MIN_POSITION_SOL, Math.min(MAX_POSITION_SOL, size));
 
-  // Conservative mode: if portfolio shrank from start, reduce to 6%
-  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.85) {
-    size = bal * 0.06 * quantMultiplier;
-    size = Math.max(MIN_POSITION_SOL, Math.min(size, MAX_POSITION_SOL * 0.6));
-    console.log(`   🛡️  CONSERVATIVE MODE: balance down from start → ${size.toFixed(4)} SOL`);
-  }
-
-  // Profit mode: if up >50% from start, take slightly smaller risk (protect gains)
-  if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 1.5) {
-    size = Math.min(size, bal * 0.05 * quantMultiplier);
-    console.log(`   📈  PROFIT PROTECT: portfolio up 50%+ → capping position at ${size.toFixed(4)} SOL`);
-  }
-
-  // Reserve guard: never risk more than (balance - reserve - other open positions)
+  // Reserve guard
   const inPositions = positions.size * (bal / Math.max(positions.size + 1, 1));
   const free = bal - MIN_BALANCE_RESERVE - inPositions;
   if (size > free * 0.5) size = Math.max(MIN_POSITION_SOL, free * 0.5);
@@ -366,6 +437,7 @@ function checkSafetyGates() {
   if (safetyState.haltedUntil > 0 && Date.now() > safetyState.haltedUntil) {
     safetyState.haltedUntil = 0;
     safetyState.tradesHalted = false;
+    safetyState.consecutiveLosses = 0; // reset streak after cooldown
     console.log('✅ SAFETY: Circuit-breaker cooldown over — trading resumed');
   }
   if (safetyState.tradesHalted) {
@@ -374,22 +446,56 @@ function checkSafetyGates() {
     return false;
   }
 
-  // 2. Daily loss limit
+  // 2. Absolute capital floor — never trade below this SOL balance
+  if (portfolio.balance <= ABSOLUTE_FLOOR_SOL) {
+    console.log(`   🔴 CAPITAL FLOOR: balance ${portfolio.balance.toFixed(4)} SOL ≤ floor ${ABSOLUTE_FLOOR_SOL} SOL — trading suspended`);
+    return false;
+  }
+
+  // 3. Daily trade cap
+  if (safetyState.dailyTradeCount >= MAX_DAILY_TRADES) {
+    console.log(`   🔴 DAILY TRADE CAP: ${safetyState.dailyTradeCount}/${MAX_DAILY_TRADES} trades today — resuming tomorrow`);
+    return false;
+  }
+
+  // 4. Consecutive loss streak breaker
+  if (safetyState.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES_HARD) {
+    console.log(`   🚨 HARD STREAK BREAKER: ${safetyState.consecutiveLosses} consecutive losses — pausing 4h`);
+    safetyState.tradesHalted = true;
+    safetyState.haltedUntil = Date.now() + STREAK_PAUSE_HARD_MS;
+    return false;
+  }
+  if (safetyState.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
+    console.log(`   ⚠️  SOFT STREAK BREAKER: ${safetyState.consecutiveLosses} consecutive losses — pausing 1h`);
+    safetyState.tradesHalted = true;
+    safetyState.haltedUntil = Date.now() + STREAK_PAUSE_MS;
+    return false;
+  }
+
+  // 5. Soft daily loss tiers — progressive position size reduction
   if (safetyState.dailyStartBalance > 0) {
     const dailyLoss = (safetyState.dailyStartBalance - portfolio.balance) / safetyState.dailyStartBalance;
     if (dailyLoss >= DAILY_LOSS_LIMIT) {
-      console.log(`   🚨 DAILY LOSS LIMIT (${(dailyLoss*100).toFixed(1)}% ≥ ${DAILY_LOSS_LIMIT*100}%) — halting for 3h`);
+      console.log(`   🚨 DAILY LOSS LIMIT (${(dailyLoss*100).toFixed(1)}% ≥ ${DAILY_LOSS_LIMIT*100}%) — halting 3h`);
       safetyState.tradesHalted = true;
       safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
       return false;
+    } else if (dailyLoss >= SOFT_LOSS_TIER2) {
+      safetyState.softSizeMultiplier = 0.40;
+      console.log(`   🟡 SOFT PROTECT T2: daily loss ${(dailyLoss*100).toFixed(1)}% → positions at 40%`);
+    } else if (dailyLoss >= SOFT_LOSS_TIER1) {
+      safetyState.softSizeMultiplier = 0.70;
+      console.log(`   🟡 SOFT PROTECT T1: daily loss ${(dailyLoss*100).toFixed(1)}% → positions at 70%`);
+    } else {
+      safetyState.softSizeMultiplier = 1.0; // full size
     }
   }
 
-  // 3. Drawdown circuit-breaker
+  // 6. Drawdown circuit-breaker
   if (portfolio.startingBalance > 0) {
     const drawdown = (portfolio.startingBalance - portfolio.balance) / portfolio.startingBalance;
     if (drawdown >= DRAWDOWN_LIMIT) {
-      console.log(`   🚨 DRAWDOWN LIMIT (${(drawdown*100).toFixed(1)}% ≥ ${DRAWDOWN_LIMIT*100}%) — halting for 3h`);
+      console.log(`   🚨 DRAWDOWN LIMIT (${(drawdown*100).toFixed(1)}% ≥ ${DRAWDOWN_LIMIT*100}%) — halting 3h`);
       safetyState.tradesHalted = true;
       safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
       return false;
@@ -399,9 +505,23 @@ function checkSafetyGates() {
   return true;
 }
 
-function recordTradeForSafety(pnlSol) {
+function recordTradeForSafety(pnlSol, pnlPercent = null) {
   safetyState.dailyPnl += pnlSol;
   if (safetyState.dailyStartBalance === 0) safetyState.dailyStartBalance = portfolio.balance;
+  // Consecutive loss tracking
+  if (pnlPercent !== null) {
+    if (pnlPercent < 0) {
+      safetyState.consecutiveLosses++;
+      console.log(`   📉 Consecutive losses: ${safetyState.consecutiveLosses}`);
+    } else {
+      safetyState.consecutiveLosses = 0; // reset on any win
+    }
+  }
+}
+
+function recordBuyForSafety() {
+  safetyState.dailyTradeCount++;
+  console.log(`   📊 Daily trade count: ${safetyState.dailyTradeCount}/${MAX_DAILY_TRADES}`);
 }
 
 function getKolScore(wallet) {
@@ -857,10 +977,12 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       entryTime: Date.now(),
       symbol: symbol || tokenMint.slice(0, 8),
       triggeredBy: new Set(triggeringWallets),
+      tier1Sold: false, tier2Sold: false,
       meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _pAgeH != null ? ageBracket(_pAgeH) : null, volLiqBracket: _pRatio != null ? volLiqBracket(_pRatio) : null, hourOfDay: new Date().getHours() },
     });
     portfolio.balance -= solAmount;
     lastBuyTime = Date.now();
+    recordBuyForSafety();
     logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
     console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | Tokens: ${tokenAmount.toFixed(2)}`);
     return true;
@@ -938,10 +1060,12 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     entryTime: Date.now(),
     symbol: symbol || tokenMint.slice(0, 8),
     txSignature: signature,
+    tier1Sold: false, tier2Sold: false,
     meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
   });
   portfolio.balance -= solAmount;
   lastBuyTime = Date.now();
+  recordBuyForSafety();
   logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
   console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
   return true;
@@ -975,7 +1099,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
     positions.delete(tokenMint);
     logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
     console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
-    recordTradeForSafety(pnlSol);
+    recordTradeForSafety(pnlSol, pnlPercent);
     const _closedTrade_p = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
     recordPatternOutcome(_closedTrade_p);
     saveMemory(_closedTrade_p);
@@ -1021,7 +1145,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   }
   logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
   console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
-  recordTradeForSafety(pnlSol);
+  recordTradeForSafety(pnlSol, pnlPercent);
   const _closedTrade_l = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, tx: signature, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
   recordPatternOutcome(_closedTrade_l);
   saveMemory(_closedTrade_l);
@@ -1046,8 +1170,22 @@ function evaluatePosition(tokenMint, currentPrice) {
     return { action: 'SELL', reason: '🔴 STOP LOSS', pnlPercent };
   }
 
-  // TAKE PROFIT
-  if (pnlPercent >= TAKE_PROFIT_PERCENT) {
+  // TIERED TAKE-PROFIT — partial sells to lock gains while letting runners run
+  // Tier 1: sell 40% at +75%
+  if (!position.tier1Sold && pnlPercent >= TP_TIER1_PCT) {
+    position.tier1Sold = true;
+    console.log(`   🎯 T1 TRIGGER: ${position.symbol} +${pnlPercent.toFixed(1)}% ≥ +${TP_TIER1_PCT}% → selling 40%`);
+    return { action: 'PARTIAL_SELL', ratio: 0.40, reason: `💰 TIER1 TP +${TP_TIER1_PCT}%`, pnlPercent };
+  }
+  // Tier 2: sell 40% at +125% (only 20% of original remains after T1+T2)
+  if (position.tier1Sold && !position.tier2Sold && pnlPercent >= TP_TIER2_PCT) {
+    position.tier2Sold = true;
+    console.log(`   🎯 T2 TRIGGER: ${position.symbol} +${pnlPercent.toFixed(1)}% ≥ +${TP_TIER2_PCT}% → selling 40% more`);
+    return { action: 'PARTIAL_SELL', ratio: 0.40, reason: `💰 TIER2 TP +${TP_TIER2_PCT}%`, pnlPercent };
+  }
+
+  // FULL TAKE PROFIT (if tiers not triggered — token went straight to target)
+  if (!position.tier1Sold && pnlPercent >= TAKE_PROFIT_PERCENT) {
     return { action: 'SELL', reason: '🟢 TAKE PROFIT', pnlPercent };
   }
 
@@ -1060,6 +1198,60 @@ function evaluatePosition(tokenMint, currentPrice) {
   }
 
   return { action: 'HOLD', reason: '⏳ HOLDING', pnlPercent };
+}
+
+// === PARTIAL SELL (Tiered Take-Profits) ===
+async function partialSellToken(connection, tokenMint, ratio, reason, knownPrice = null) {
+  const position = positions.get(tokenMint);
+  if (!position) return false;
+
+  const sellRatio = Math.min(1.0, Math.max(0.01, ratio));
+  const tokenAmountToSell = position.amount * sellRatio;
+
+  let currentPrice = knownPrice || await getTokenPrice(tokenMint);
+  if (!currentPrice) currentPrice = position.entryPrice;
+
+  const proceedsSol = tokenAmountToSell * currentPrice;
+  const pnlSol = proceedsSol - (position.solInvested * sellRatio);
+  const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+
+  if (PAPER_MODE) {
+    position.amount -= tokenAmountToSell;
+    position.solInvested *= (1 - sellRatio);
+    portfolio.balance += proceedsSol;
+    portfolio.totalPnl += pnlSol;
+    logTrade(`📙 PARTIAL SELL ${(sellRatio*100).toFixed(0)}% (${reason})`, position.symbol, currentPrice, pnlPercent);
+    console.log(`   └─ Sold ${(sellRatio*100).toFixed(0)}% | +${proceedsSol.toFixed(4)} SOL | Remaining: ${position.amount.toFixed(2)} tokens`);
+    return true;
+  }
+
+  // Live partial sell via Jupiter
+  try {
+    const tokenDecimals = 6;
+    const rawAmount = Math.floor(tokenAmountToSell * (10 ** tokenDecimals));
+    const quoteRes = await fetch(
+      `https://quote-api.jup.ag/v6/quote?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${rawAmount}&slippageBps=${SLIPPAGE_BPS}`
+    );
+    const quote = await quoteRes.json();
+    if (!quote?.routePlan?.length) {
+      console.log(`   ⚠️  Partial sell: no Jupiter route — keeping position`);
+      return false;
+    }
+    const signature = await executeJupiterSwap(connection, quote);
+    if (!signature) return false;
+
+    const solOut = parseInt(quote.outAmount) / 1e9;
+    position.amount -= tokenAmountToSell;
+    position.solInvested *= (1 - sellRatio);
+    portfolio.balance += solOut;
+    portfolio.totalPnl += (solOut - position.solInvested * sellRatio);
+    logTrade(`📙 PARTIAL SELL ${(sellRatio*100).toFixed(0)}% (${reason})`, position.symbol, currentPrice, pnlPercent);
+    console.log(`   └─ Sold ${(sellRatio*100).toFixed(0)}% | +${solOut.toFixed(4)} SOL | TX: ${signature.slice(0,16)}...`);
+    return true;
+  } catch (e) {
+    console.log(`   ❌ Partial sell failed: ${e.message?.slice(0,80)}`);
+    return false;
+  }
 }
 
 // === WALLET MONITORING (Copy Trading Core) ===
@@ -1299,6 +1491,10 @@ async function monitorPositions(connection) {
       continue;
     }
 
+    if (result.action === 'PARTIAL_SELL') {
+      await partialSellToken(connection, mint, result.ratio, result.reason, currentPrice);
+      continue; // Don't remove position — it's still open
+    }
     if (result.action === 'SELL') {
       await sellToken(connection, mint, result.reason, currentPrice);
     } else {
