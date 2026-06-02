@@ -8,6 +8,9 @@ const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
 const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is set
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
+const MEMORY_FILE  = 'memory.json';
 
 // === RISK MANAGEMENT ===
 const STOP_LOSS_PERCENT = 25;         // Sell if down 25%
@@ -51,6 +54,200 @@ const COPY_WALLETS = [
 
 
 ];
+
+
+// ══════════════════════════════════════════════════════════════
+// === TRADE MEMORY — GitHub-persisted, survives restarts ===
+// ══════════════════════════════════════════════════════════════
+let memory = {
+  version: 2,
+  kolScores: {},      // wallet → { trades, wins, totalPnl }
+  closedTrades: [],   // full history (last 500)
+  patternStats: {
+    byAgeBracket:    {},  // '0-2h' | '2-4h' | '4-8h' → { trades, wins }
+    byVolLiqBracket: {},  // '0-1'  | '1-3'  | '3+'   → { trades, wins }
+    byHourOfDay:     {},  // '0'–'23'                  → { trades, wins }
+    bySource:        {},  // 'kol' | 'scanner'          → { trades, wins }
+  },
+  updatedAt: null,
+};
+
+async function loadMemory() {
+  if (!GITHUB_TOKEN) {
+    console.log('ℹ️  No GITHUB_TOKEN — trade memory is session-only (set env var to persist)');
+    return;
+  }
+  try {
+    const resp = await safeFetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/contents/${MEMORY_FILE}`,
+      { headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github.v3+json' } }
+    );
+    if (!resp?.content) { console.log('ℹ️  No memory.json yet — starting fresh'); return; }
+    const raw = JSON.parse(Buffer.from(resp.content.replace(/\n/g,''), 'base64').toString('utf8'));
+    // Merge into memory
+    if (raw.kolScores)    memory.kolScores    = raw.kolScores;
+    if (raw.closedTrades) memory.closedTrades = raw.closedTrades.slice(-500);
+    if (raw.patternStats) memory.patternStats = raw.patternStats;
+    memory.updatedAt = raw.updatedAt || null;
+    memory._sha = resp.sha; // needed for updates
+    // Seed in-memory kolScores Map from persisted data
+    for (const [wallet, s] of Object.entries(memory.kolScores)) {
+      kolScores.set(wallet, { trades: s.trades, wins: s.wins, totalPnl: s.totalPnl });
+    }
+    const total = memory.closedTrades.length;
+    const wins  = memory.closedTrades.filter(t => t.pnlPercent > 0).length;
+    console.log(`🧠 Memory loaded: ${total} trades (${wins} wins) | ${Object.keys(memory.kolScores).length} KOLs scored`);
+  } catch (e) {
+    console.log('⚠️  Memory load failed:', e.message);
+  }
+}
+
+async function saveMemory(trade) {
+  // Sync kolScores Map → plain object
+  for (const [w, s] of kolScores.entries()) {
+    memory.kolScores[w] = { trades: s.trades, wins: s.wins, totalPnl: s.totalPnl };
+  }
+  if (trade) memory.closedTrades.push(trade);
+  if (memory.closedTrades.length > 500) memory.closedTrades = memory.closedTrades.slice(-500);
+  memory.updatedAt = new Date().toISOString();
+
+  if (!GITHUB_TOKEN) return; // session-only mode
+
+  try {
+    const content = Buffer.from(JSON.stringify(memory, null, 2)).toString('base64');
+    const body = {
+      message: `memory: update after trade — ${memory.closedTrades.length} trades logged`,
+      content,
+      ...(memory._sha ? { sha: memory._sha } : {}),
+    };
+    const resp = await safeFetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/contents/${MEMORY_FILE}`,
+      {
+        method: 'PUT',
+        headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }
+    );
+    if (resp?.content?.sha) memory._sha = resp.content.sha;
+    console.log('💾 Memory saved to GitHub');
+  } catch (e) {
+    console.log('⚠️  Memory save failed:', e.message);
+  }
+}
+
+// Classify a value into a named bracket for pattern stats
+function ageBracket(ageHours) {
+  if (ageHours < 2)  return '0-2h';
+  if (ageHours < 4)  return '2-4h';
+  if (ageHours < 8)  return '4-8h';
+  return '8h+';
+}
+function volLiqBracket(ratio) {
+  if (ratio < 1) return '0-1';
+  if (ratio < 3) return '1-3';
+  return '3+';
+}
+function recordPatternOutcome(trade) {
+  const cats = [
+    ['byAgeBracket',    trade.ageBracket],
+    ['byVolLiqBracket', trade.volLiqBracket],
+    ['byHourOfDay',     trade.hourOfDay?.toString()],
+    ['bySource',        trade.source],
+  ];
+  for (const [dim, key] of cats) {
+    if (!key) continue;
+    if (!memory.patternStats[dim][key]) memory.patternStats[dim][key] = { trades: 0, wins: 0 };
+    memory.patternStats[dim][key].trades++;
+    if (trade.pnlPercent > 0) memory.patternStats[dim][key].wins++;
+  }
+}
+function patternWinRate(dim, key) {
+  const s = memory.patternStats[dim]?.[key];
+  if (!s || s.trades < 2) return 0.5; // not enough data
+  return s.wins / s.trades;
+}
+
+// ══════════════════════════════════════════════════════════════
+// === QUANTIFICATION ENGINE — score every signal 0-100 ===
+// ══════════════════════════════════════════════════════════════
+function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
+  let score = 0;
+  const reasons = [];
+
+  // — KOL component (0-40 pts) —
+  if (kolWallets && kolWallets.length > 0) {
+    let totalWr = 0, n = 0;
+    for (const w of kolWallets) {
+      const s = kolScores.get(w);
+      if (s && s.trades >= 2) { totalWr += s.wins / s.trades; n++; }
+      else totalWr += 0.5, n++;
+    }
+    const avgWr = n ? totalWr / n : 0.5;
+    const kolPts = Math.round(avgWr * 40);
+    score += kolPts;
+    reasons.push(`KOL(${(avgWr * 100).toFixed(0)}%→${kolPts}pts)`);
+  } else {
+    score += 20; // neutral for scanner-initiated
+    reasons.push('KOL(neutral→20pts)');
+  }
+
+  // — Age component (0-20 pts) — freshest tokens = most momentum upside
+  if (tokenInfo?.createdAt) {
+    const ageH = (Date.now() / 1000 - tokenInfo.createdAt) / 3600;
+    let agePts = ageH < 1 ? 20 : ageH < 2 ? 17 : ageH < 4 ? 13 : ageH < 8 ? 8 : 3;
+    score += agePts;
+    reasons.push(`age(${ageH.toFixed(1)}h→${agePts}pts)`);
+  }
+
+  // — Volume/Liquidity turnover (0-15 pts) —
+  if (tokenInfo?.v24hUSD && tokenInfo?.liquidity) {
+    const ratio = tokenInfo.v24hUSD / tokenInfo.liquidity;
+    let vlPts = ratio >= 5 ? 15 : ratio >= 3 ? 12 : ratio >= 1.5 ? 8 : ratio >= 1 ? 5 : 2;
+    score += vlPts;
+    reasons.push(`V/L(${ratio.toFixed(1)}→${vlPts}pts)`);
+  }
+
+  // — Volume size (0-10 pts) —
+  if (tokenInfo?.v24hUSD) {
+    const vol = tokenInfo.v24hUSD;
+    let volPts = vol > 500000 ? 10 : vol > 200000 ? 8 : vol > 100000 ? 6 : vol > 50000 ? 4 : 2;
+    score += volPts;
+    reasons.push(`vol($${(vol/1000).toFixed(0)}K→${volPts}pts)`);
+  }
+
+  // — Pattern learning bonus (0-15 pts) — from historical win rates
+  if (tokenInfo) {
+    const ageH = tokenInfo.createdAt ? (Date.now()/1000 - tokenInfo.createdAt)/3600 : null;
+    const ratio = (tokenInfo.v24hUSD && tokenInfo.liquidity) ? tokenInfo.v24hUSD / tokenInfo.liquidity : null;
+    const hour  = new Date().getHours();
+    const ab = ageH  != null ? ageBracket(ageH)     : null;
+    const vb = ratio != null ? volLiqBracket(ratio)  : null;
+    const wr = [
+      ab ? patternWinRate('byAgeBracket',    ab)    : null,
+      vb ? patternWinRate('byVolLiqBracket', vb)    : null,
+      patternWinRate('byHourOfDay',  hour.toString()),
+      patternWinRate('bySource',     source),
+    ].filter(x => x !== null);
+    if (wr.length) {
+      const avgWr = wr.reduce((a, b) => a + b, 0) / wr.length;
+      const patPts = Math.round((avgWr - 0.5) * 30); // -15 to +15
+      score += patPts;
+      reasons.push(`pattern(${(avgWr*100).toFixed(0)}%→${patPts}pts)`);
+    }
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  // Determine position multiplier
+  let multiplier, action;
+  if (score >= 70)      { multiplier = 1.3; action = 'FULL+'; }
+  else if (score >= 50) { multiplier = 1.0; action = 'FULL';  }
+  else if (score >= 30) { multiplier = 0.7; action = 'HALF';  }
+  else                  { multiplier = 0;   action = 'SKIP';  }
+
+  console.log(`   📐 QUANT SCORE: ${score}/100 [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
+  return { score, multiplier, action };
+}
 
 // === STATE ===
 const portfolio = { balance: 0, totalPnl: 0 };
@@ -507,6 +704,9 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       return false;
     }
     const tokenAmount = solAmount / price;
+    const _ptinfo = await getTokenInfo(tokenMint).catch(() => null);
+    const _pAgeH = _ptinfo?.createdAt ? (Date.now()/1000 - _ptinfo.createdAt)/3600 : null;
+    const _pRatio = (_ptinfo?.v24hUSD && _ptinfo?.liquidity) ? _ptinfo.v24hUSD / _ptinfo.liquidity : null;
     positions.set(tokenMint, {
       entryPrice: price,
       highestPrice: price,
@@ -515,6 +715,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       entryTime: Date.now(),
       symbol: symbol || tokenMint.slice(0, 8),
       triggeredBy: new Set(triggeringWallets),
+      meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _pAgeH != null ? ageBracket(_pAgeH) : null, volLiqBracket: _pRatio != null ? volLiqBracket(_pRatio) : null, hourOfDay: new Date().getHours() },
     });
     portfolio.balance -= solAmount;
     lastBuyTime = Date.now();
@@ -543,6 +744,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       return false;
     }
     // Record position from pump.fun buy
+    const _pfAgeH = null; // pump.fun token — age not available pre-graduation
     positions.set(tokenMint, {
       entryPrice: pumpResult.price,
       highestPrice: pumpResult.price,
@@ -551,6 +753,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       entryTime: Date.now(),
       symbol: symbol || tokenMint.slice(0, 8),
       txSignature: pumpResult.sig,
+      meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: null, hourOfDay: new Date().getHours() },
     });
     portfolio.balance -= solAmount;
     lastBuyTime = Date.now();
@@ -582,6 +785,9 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
 
   // Record position
   const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 6));
+  const _ltinfo = await getTokenInfo(tokenMint).catch(() => null);
+  const _lAgeH = _ltinfo?.createdAt ? (Date.now()/1000 - _ltinfo.createdAt)/3600 : null;
+  const _lRatio = (_ltinfo?.v24hUSD && _ltinfo?.liquidity) ? _ltinfo.v24hUSD / _ltinfo.liquidity : null;
   positions.set(tokenMint, {
     entryPrice: price,
     highestPrice: price,
@@ -590,6 +796,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     entryTime: Date.now(),
     symbol: symbol || tokenMint.slice(0, 8),
     txSignature: signature,
+    meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
   });
   portfolio.balance -= solAmount;
   lastBuyTime = Date.now();
@@ -626,6 +833,9 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
     positions.delete(tokenMint);
     logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
     console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
+    const _closedTrade_p = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
+    recordPatternOutcome(_closedTrade_p);
+    saveMemory(_closedTrade_p);
     return true;
   }
 
@@ -668,6 +878,9 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   }
   logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
   console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+  const _closedTrade_l = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, tx: signature, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
+  recordPatternOutcome(_closedTrade_l);
+  saveMemory(_closedTrade_l);
   return true;
 }
 
@@ -788,7 +1001,13 @@ async function monitorCopyWallets(connection) {
                         console.log(`   ℹ️  ${symbol} — no Birdeye data yet, trusting multi-KOL consensus`);
                       }
 
-                      const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
+                      const { multiplier: _qMul, action: _qAct } = quantifySignal([...signal.wallets], info, 'kol');
+                      if (_qAct === 'SKIP') {
+                        console.log(`   ⏭️  QUANT: KOL signal skipped (low score)`);
+                        kolSignals.delete(tokenMint);
+                        continue;
+                      }
+                      const tradeSize = Math.min(getDynamicPositionSize([...signal.wallets]) * _qMul, portfolio.balance * 0.2);
                       console.log(`   🚀 CONSENSUS COPY: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL (${signal.wallets.size} KOLs confirmed)`);
                       await buyToken(connection, tokenMint, tradeSize, symbol, signal.wallets);
                       kolSignals.delete(tokenMint); // Clear after execution
@@ -881,8 +1100,10 @@ async function scanNewTokens(connection) {
     if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
     if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
+    const { multiplier: _sqMul, action: _sqAct } = quantifySignal([], info, 'scanner');
+    if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters!`);
-    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.15);
+    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul, portfolio.balance * 0.15);
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
     const bought = await buyToken(connection, addr, tradeSize, symbol);
     if (bought) break; // One independent trade per scan cycle
@@ -962,8 +1183,10 @@ async function main() {
   const balance = await connection.getBalance(pubkey);
   portfolio.balance = balance / LAMPORTS_PER_SOL;
 
+  await loadMemory();
+
   console.log('\n' + '═'.repeat(50));
-  console.log('🚀 SOL BOT v5.1 - Copy Trading + Jupiter Execution');
+  console.log('🚀 SOL BOT v5.2 - Copy Trading + Quant Memory Engine');
   console.log('═'.repeat(50));
   console.log(`${PAPER_MODE ? '📝 PAPER MODE' : '💎 LIVE MODE — REAL MONEY'}`);
   console.log(`💰 Balance: ${portfolio.balance.toFixed(4)} SOL`);
