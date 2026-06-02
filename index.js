@@ -1,4 +1,4 @@
-// SOL BOT v8.0 PROFIT HUNTER - Capital Protection + Full Scaling + Momentum Sniper + Streak Reinvestment + Fast Exit
+// SOL BOT v8.1 PROFIT HUNTER - Bug fixes: AI error logging + Jupiter escalating slippage (3%→5%→10%)
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -287,8 +287,22 @@ async function aiAnalyzeSignal(tokenInfo, source) {
       body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], max_tokens: 80, temperature: 0.2 }),
     });
     const data = await res.json();
-    const text = data.choices?.[0]?.message?.content?.trim() || '{}';
+    // Detect OpenAI API errors (wrong key, quota, etc.)
+    if (!res.ok || data.error) {
+      const errMsg = data.error?.message || data.error || `HTTP ${res.status}`;
+      console.log(`   ❌ OpenAI API error: ${errMsg}`);
+      return { boost: 0, verdict: 'api-error' };
+    }
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (!text) {
+      console.log(`   ⚠️  OpenAI empty response (choices=${JSON.stringify(data.choices?.length)})`);
+      return { boost: 0, verdict: 'empty' };
+    }
     const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    if (!parsed.verdict) {
+      console.log(`   ⚠️  AI parse failed, raw: ${text.slice(0, 80)}`);
+      return { boost: 0, verdict: 'parse-error' };
+    }
     const boost = Math.max(0, Math.min(25, parsed.boost || 0));
     console.log(`   🤖 AI VERDICT: ${parsed.verdict} | boost+${boost} | ${parsed.reason}`);
     return { boost, verdict: parsed.verdict, reason: parsed.reason };
@@ -648,6 +662,22 @@ async function safeFetch(url, options = {}) {
   }
 }
 
+async function safeFetchVerbose(url, options = {}, label = '') {
+  try {
+    const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      const errMsg = data?.error?.message || data?.error || data?.message || res.statusText;
+      console.log(`   ❌ ${label || url.slice(0,60)} → HTTP ${res.status}: ${errMsg}`);
+      return null;
+    }
+    return data;
+  } catch (e) {
+    console.log(`   ❌ ${label || 'fetch'} error: ${e.message}`);
+    return null;
+  }
+}
+
 function logTrade(action, token, price, pnlPercent = null) {
   const time = new Date().toLocaleTimeString();
   const pnlStr = pnlPercent !== null ? ` (${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)` : '';
@@ -754,22 +784,42 @@ async function getTokenInfo(mintAddress) {
 // === JUPITER SWAP ENGINE (Core live trading logic) ===
 // ══════════════════════════════════════════════════════════════
 
-async function getJupiterQuote(inputMint, outputMint, amountLamports) {
+async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBpsOverride = null) {
+  const slippage = slippageBpsOverride ?? SLIPPAGE_BPS;
   const params = new URLSearchParams({
     inputMint,
     outputMint,
     amount: amountLamports.toString(),
-    slippageBps: SLIPPAGE_BPS.toString(),
+    slippageBps: slippage.toString(),
     onlyDirectRoutes: 'false',
     asLegacyTransaction: 'false',
   });
 
-  const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
-  if (!quote) {
-    console.log('   ❌ Jupiter quote failed');
+  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`);
+  if (!quote) return null;
+  // Jupiter returns HTTP 200 but with error field when no route exists
+  if (quote.error || !quote.outAmount) {
+    console.log(`   ❌ Jupiter: no route — ${quote.error || 'outAmount missing'}`);
     return null;
   }
   return quote;
+}
+
+// Tries Jupiter with escalating slippage before giving up
+async function getJupiterQuoteWithFallback(inputMint, outputMint, amountLamports) {
+  // Tier 1: 3% (default — tight, fast)
+  let q = await getJupiterQuote(inputMint, outputMint, amountLamports, 300);
+  if (q) return q;
+  await new Promise(r => setTimeout(r, 2000));
+  // Tier 2: 5% — new tokens with thin books
+  console.log('   🔄 Retrying Jupiter at 5% slippage...');
+  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 500);
+  if (q) return q;
+  await new Promise(r => setTimeout(r, 3000));
+  // Tier 3: 10% — very new/illiquid (memecoins post-launch)
+  console.log('   🔄 Retrying Jupiter at 10% slippage...');
+  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 1000);
+  return q;
 }
 
 async function executeJupiterSwap(connection, quote) {
@@ -1037,13 +1087,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Attempt Jupiter quote unconditionally — new tokens may not have DexScreener/Birdeye
   // data yet, so we don't gate on price availability upfront.
   console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
-  let quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
-  if (!quote) {
-    // Retry once after 3s — brand new pools take a moment to be indexed by Jupiter
-    console.log(`   ⏳ Quote failed, retrying in 3s (new pool may still be indexing)...`);
-    await new Promise(r => setTimeout(r, 3000));
-    quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
-  }
+  let quote = await getJupiterQuoteWithFallback(SOL_MINT, tokenMint, amountLamports);
   if (!quote) {
     // Jupiter failed after retry — fall back to pump.fun bonding curve direct buy
     console.log(`   🔄 Jupiter failed, trying pump.fun bonding curve direct...`);
