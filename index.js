@@ -1,4 +1,4 @@
-// SOL BOT v9.5 - Groq AI (free, llama-3.3-70b) replaces OpenAI; RPC cache; sim 429 retry; Jupiter fallback endpoint
+// SOL BOT v9.6 - Sell escalating slippage (3%→50%); TX confirm fix; rug fast-stop 20%/2min; trending scanner
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -482,8 +482,8 @@ const TP_TIER2_PCT             = 100;    // 125%→100% — de-risk while lettin
 
 // ─── PROFIT HUNTER MODE ───────────────────────────────────────
 const PROFIT_HUNTER_MODE       = true;
-const PH_FAST_STOP_PCT         = 15;    // Cut position at −15% if still in first 5 min
-const PH_FAST_STOP_WINDOW_MS   = 5 * 60 * 1000;  // 5-min window for fast stop
+const PH_FAST_STOP_PCT         = 20;    // Cut position at −20% if still in first 2 min (was −15% / 5min)
+const PH_FAST_STOP_WINDOW_MS   = 2 * 60 * 1000;  // 2-min window for fast stop (was 5min)
 const PH_RUN_THRESHOLD_PCT     = 60;    // Above +60% PnL → skip max-hold eviction (let it run)
 const PH_MOMENTUM_5M_MIN       = 3;     // 5%→3% — catch momentum earlier
 const PH_MOMENTUM_1H_MIN       = 7;     // 10%→7% — wider trend confirmation
@@ -973,12 +973,29 @@ async function executeJupiterSwap(connection, quote) {
       skipPreflight: true,
       maxRetries: 3,
     });
+    console.log(`   📡 TX sent: https://solscan.io/tx/${signature}`);
 
-    // Confirm transaction
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-    if (confirmation.value.err) {
-      console.log(`   ❌ TX failed: ${JSON.stringify(confirmation.value.err)}`);
-      return null;
+    // Confirm using blockhash-aware form — prevents "expired blockhash" false failures
+    try {
+      const { blockhash: bh, lastValidBlockHeight: lvbh } = await connection.getLatestBlockhash('confirmed');
+      const confirmation = await connection.confirmTransaction({ signature, blockhash: bh, lastValidBlockHeight: lvbh }, 'confirmed');
+      if (confirmation.value.err) {
+        console.log(`   ❌ TX failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+        return null;
+      }
+    } catch (confirmErr) {
+      // Timeout / network error — don't mark as failed; verify via status check instead
+      console.log(`   ⚠️  Confirmation timed out (${confirmErr.message?.slice(0,60)}) — verifying TX...`);
+      await new Promise(r => setTimeout(r, 6000));
+      try {
+        const status = await connection.getSignatureStatus(signature);
+        if (status?.value?.err) {
+          console.log(`   ❌ TX status: failed — ${JSON.stringify(status.value.err)}`);
+          return null;
+        }
+        const cs = status?.value?.confirmationStatus;
+        console.log(`   ✅ TX status: ${cs || 'pending'} — treating as success`);
+      } catch { /* best-effort verify — assume success */ }
     }
 
     console.log(`   ✅ TX confirmed: https://solscan.io/tx/${signature}`);
@@ -1439,10 +1456,20 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const decimals = tokenInfo?.decimals || 9;
   const amountRaw = Math.floor(position.amount * (10 ** decimals));
 
-  console.log(`🔄 Getting Jupiter quote: ${position.symbol} → SOL (${reason})`);
-  const quote = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw);
+  // Escalating slippage on sell — memecoin liquidity is thin; 3% alone fails constantly
+  console.log(`🔄 Getting sell quote: ${position.symbol} → SOL (${reason})`);
+  const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
+  let quote = null;
+  for (let si = 0; si < sellSlippageRamp.length; si++) {
+    if (si > 0) {
+      await new Promise(r => setTimeout(r, 1500));
+      console.log(`   🔄 Sell retry at ${sellSlippageRamp[si]/100}% slippage...`);
+    }
+    quote = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw, sellSlippageRamp[si]);
+    if (quote) break;
+  }
   if (!quote) {
-    console.log(`   ❌ Quote failed for sell — will retry next cycle`);
+    console.log(`   ❌ Quote failed for sell after all slippage tiers — will retry next cycle`);
     return false;
   }
 
@@ -1451,7 +1478,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
 
   const signature = await executeJupiterSwap(connection, quote);
   if (!signature) {
-    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
+    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${position.symbol} — check TX error above`);
     return false;
   }
 
@@ -1560,16 +1587,22 @@ async function partialSellToken(connection, tokenMint, ratio, reason, knownPrice
     return true;
   }
 
-  // Live partial sell via Jupiter
+  // Live partial sell via Jupiter — escalating slippage
   try {
     const tokenDecimals = 6;
     const rawAmount = Math.floor(tokenAmountToSell * (10 ** tokenDecimals));
-    const quoteRes = await fetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${rawAmount}&slippageBps=${SLIPPAGE_BPS}`
-    );
-    const quote = await quoteRes.json();
-    if (!quote?.routePlan?.length) {
-      console.log(`   ⚠️  Partial sell: no Jupiter route — keeping position`);
+    const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
+    let quote = null;
+    for (let si = 0; si < sellSlippageRamp.length; si++) {
+      if (si > 0) {
+        await new Promise(r => setTimeout(r, 1500));
+        console.log(`   🔄 Partial sell retry at ${sellSlippageRamp[si]/100}% slippage...`);
+      }
+      quote = await getJupiterQuote(tokenMint, SOL_MINT, rawAmount, sellSlippageRamp[si]);
+      if (quote) break;
+    }
+    if (!quote) {
+      console.log(`   ⚠️  Partial sell: no Jupiter route at any slippage — keeping position`);
       return false;
     }
     const signature = await executeJupiterSwap(connection, quote);
@@ -1742,11 +1775,20 @@ async function scanNewTokens(connection) {
       if (!rawTokens.includes(t.tokenAddress)) rawTokens.push(t.tokenAddress);
     });
   }
+  // Source 3: DexScreener trending — highest-momentum tokens right now
+  const trending = await safeFetch('https://api.dexscreener.com/latest/dex/tokens/trending');
+  if (trending?.pairs) {
+    trending.pairs.filter(p => p.chainId === 'solana').forEach(p => {
+      if (p.baseToken?.address && !rawTokens.includes(p.baseToken.address)) {
+        rawTokens.push(p.baseToken.address);
+      }
+    });
+  }
 
-  rawTokens = rawTokens.filter(addr => !positions.has(addr)).slice(0, 15);
+  rawTokens = rawTokens.filter(addr => !positions.has(addr)).slice(0, 20);
   if (rawTokens.length === 0) return;
 
-  console.log(`🔍 Scanning ${rawTokens.length} DexScreener candidates...`);
+  console.log(`🔍 Scanning ${rawTokens.length} DexScreener candidates (boosted+profiles+trending)...`);
 
   // Score each token using DexScreener pair data (getTokenInfo now uses DexScreener)
   for (const addr of rawTokens) {
