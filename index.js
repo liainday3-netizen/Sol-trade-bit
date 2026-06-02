@@ -1,4 +1,4 @@
-// SOL BOT v9.2 - Stable Route Engine (bonding curve detection, priority fees, 50% slippage, route telemetry)
+// SOL BOT v9.3 - Rate limit fix: BC cache (90s TTL), safeFetch 429 backoff, zero duplicate RPC calls
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -361,6 +361,32 @@ function logRouteStats() {
   const jp = routeStats.jupiterSwap;
   console.log(`   📊 ROUTE STATS | pump.fun: ${pf.ok}✅ ${pf.fail}❌ | Jupiter: ${jp.ok}✅ ${jp.fail}❌ | exhausted: ${routeStats.exhausted}`);
 }
+
+// === BONDING CURVE CACHE ===
+// Avoids duplicate RPC getAccountInfo calls for same mint within 90s
+const bcCache = new Map(); // mint → { hasBondingCurve, bcComplete, ts }
+const BC_CACHE_TTL_MS = 90_000;
+async function getBondingCurveInfo(connection, tokenMint) {
+  const cached = bcCache.get(tokenMint);
+  if (cached && Date.now() - cached.ts < BC_CACHE_TTL_MS) return cached;
+  try {
+    const mint = new PublicKey(tokenMint);
+    const [bondingCurveAddr] = PublicKey.findProgramAddressSync(
+      [Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM
+    );
+    const bcInfo = await connection.getAccountInfo(bondingCurveAddr);
+    const result = {
+      hasBondingCurve: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)),
+      bcComplete: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM) && bcInfo.data[48] === 1),
+      bcInfo: (bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)) ? bcInfo : null,
+      ts: Date.now(),
+    };
+    bcCache.set(tokenMint, result);
+    return result;
+  } catch {
+    return { hasBondingCurve: false, bcComplete: false, bcInfo: null, ts: Date.now() };
+  }
+}
 const profitHunterState = {
   consecutiveWins: 0,      // reset on any loss
   reEntryAllowed: new Set(), // tokens closed at TP — may re-enter
@@ -687,9 +713,15 @@ if (PRIVATE_KEY) {
 }
 
 // === HELPERS ===
-async function safeFetch(url, options = {}) {
+async function safeFetch(url, options = {}, _retries = 2) {
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+    if (res.status === 429 && _retries > 0) {
+      const retryAfter = parseInt(res.headers.get('Retry-After') || '2', 10);
+      const delay = Math.min(retryAfter * 1000, 8000);
+      await new Promise(r => setTimeout(r, delay));
+      return safeFetch(url, options, _retries - 1);
+    }
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -918,27 +950,14 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
   const label = symbol || tokenMint.slice(0, 12);
   const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
 
-  // ─── Step 1: Detect bonding curve ──────────────────────────
-  let hasBondingCurve = false;
-  let bcComplete = false;
-  try {
-    const mint = new PublicKey(tokenMint);
-    const [bondingCurveAddr] = PublicKey.findProgramAddressSync(
-      [Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM
-    );
-    const bcInfo = await connection.getAccountInfo(bondingCurveAddr);
-    if (bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)) {
-      hasBondingCurve = true;
-      bcComplete = bcInfo.data[48] === 1; // 'complete' flag in bonding curve struct
-    }
-  } catch { /* ignore — treat as no bonding curve */ }
-
+  // ─── Step 1: Bonding curve detection (cached — no duplicate RPC) ──
+  const { hasBondingCurve, bcComplete, bcInfo } = await getBondingCurveInfo(connection, tokenMint);
   console.log(`   🗺️  ROUTE ENGINE | ${label} | bonding_curve=${hasBondingCurve} complete=${bcComplete}`);
 
   // ─── Route A: pump.fun direct (active bonding curve only) ──
   if (hasBondingCurve && !bcComplete) {
     console.log(`   🎯 ROUTE A: pump.fun bonding curve direct`);
-    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount, bcInfo /* cached — no re-fetch */);
     if (pumpResult) {
       routeStats.pumpFunDirect.ok++;
       console.log(`   ✅ ROUTE A success`);
@@ -1006,7 +1025,7 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
 // Used when Jupiter can't route (token still on bonding curve pre-migration)
 // ══════════════════════════════════════════════════════════════
 
-async function buyPumpFunDirect(connection, tokenMint, solAmount) {
+async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo = null) {
   if (!keypair) { console.log('   ❌ No keypair for pump.fun buy'); return null; }
 
   const mint     = new PublicKey(tokenMint);
@@ -1042,8 +1061,8 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   const [bondingCurve]   = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
   const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
 
-  // Read bonding curve account
-  const bcInfo = await connection.getAccountInfo(bondingCurve);
+  // Use cached BC info if provided by routeEngine (avoids duplicate RPC call)
+  const bcInfo = cachedBcInfo || await connection.getAccountInfo(bondingCurve);
   if (!bcInfo) { console.log('   ❌ Not a pump.fun token (no bonding curve)'); return null; }
 
   // Verify owner — if it's a different program, skip silently to avoid simulation errors
