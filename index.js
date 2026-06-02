@@ -198,6 +198,10 @@ async function getTokenPrice(mintAddress) {
       const jupSol = await safeFetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
       solUsd = jupSol?.data?.[SOL_MINT]?.price ? parseFloat(jupSol.data[SOL_MINT].price) : null;
     }
+    if (!solUsd) {
+      const kcSol = await safeFetch('https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=SOL-USDT');
+      solUsd = kcSol?.data?.price ? parseFloat(kcSol.data.price) : null;
+    }
     solUsd = solUsd || 85; // Last resort hardcoded fallback
     const quote = await safeFetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
@@ -584,7 +588,12 @@ async function monitorCopyWallets(connection) {
             }
           } catch (parseErr) {
             // TX parsing failed — skip this one
-            console.log(`   ⚠️  Could not parse TX (might be non-swap)`);
+            const errMsg = parseErr?.message || String(parseErr);
+            if (errMsg.includes('timeout') || errMsg.includes('network')) {
+              console.log(`   ⏱️  TX fetch timeout — skipping`);
+            } else {
+              console.log(`   ⚠️  TX parse error: ${errMsg.slice(0, 80)}`);
+            }
           }
         }
       }
@@ -802,6 +811,11 @@ async function main() {
     if (!solUsdPrice) {
       const bnData = await safeFetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
       solUsdPrice = bnData?.price ? parseFloat(bnData.price) : null;
+    }
+    // Fallback: KuCoin public API (geo-permissive, no key required)
+    if (!solUsdPrice) {
+      const kcData = await safeFetch('https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=SOL-USDT');
+      solUsdPrice = kcData?.data?.price ? parseFloat(kcData.data.price) : null;
     }
     // Fallback: Jupiter price API v2
     if (!solUsdPrice) {
