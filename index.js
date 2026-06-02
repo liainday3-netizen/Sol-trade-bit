@@ -331,14 +331,14 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   }
 
   const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-  const price = await getTokenPrice(tokenMint);
-  if (!price) {
-    console.log(`   ❌ Cannot get price for ${symbol || tokenMint.slice(0, 8)}`);
-    return false;
-  }
 
   if (PAPER_MODE) {
-    // Paper trade
+    // Paper trade — price needed for simulated entry
+    const price = await getTokenPrice(tokenMint);
+    if (!price) {
+      console.log(`   ❌ Cannot get price for ${symbol || tokenMint.slice(0, 8)}`);
+      return false;
+    }
     const tokenAmount = solAmount / price;
     positions.set(tokenMint, {
       entryPrice: price,
@@ -357,8 +357,16 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   }
 
   // === LIVE TRADE ===
+  // Attempt Jupiter quote unconditionally — new tokens may not have DexScreener/Birdeye
+  // data yet, so we don't gate on price availability upfront.
   console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
-  const quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  let quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  if (!quote) {
+    // Retry once after 3s — brand new pools take a moment to be indexed by Jupiter
+    console.log(`   ⏳ Quote failed, retrying in 3s (new pool may still be indexing)...`);
+    await new Promise(r => setTimeout(r, 3000));
+    quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  }
   if (!quote) {
     console.log(`   ❌ TRADE BLOCKED: Jupiter could not quote ${symbol || tokenMint.slice(0,12)} — no route (new token or low liquidity pool)`);
     return false;
@@ -367,6 +375,18 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   const expectedOut = parseInt(quote.outAmount);
   console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
 
+  // Fetch price — derive from Jupiter quote if external APIs unavailable for this token
+  let price = await getTokenPrice(tokenMint);
+  if (!price && expectedOut > 0) {
+    const decimals = quote.outputDecimals || 6;
+    price = solAmount / (expectedOut / (10 ** decimals));
+    console.log(`   ℹ️  Price derived from Jupiter quote: $${price.toFixed(10)}`);
+  }
+  if (!price) {
+    console.log(`   ❌ Cannot determine price for ${symbol || tokenMint.slice(0, 8)}, skipping`);
+    return false;
+  }
+
   const signature = await executeJupiterSwap(connection, quote);
   if (!signature) {
     console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
@@ -374,7 +394,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   }
 
   // Record position
-  const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 9)); // Adjust decimals
+  const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 6));
   positions.set(tokenMint, {
     entryPrice: price,
     highestPrice: price,
