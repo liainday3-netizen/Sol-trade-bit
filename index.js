@@ -1,4 +1,4 @@
-// SOL BOT v7.0 ADVANCED - Capital Protection + Full Scaling (Kelly/Streak/Volatility/Tiered TP) + AI Signal Analysis
+// SOL BOT v8.0 PROFIT HUNTER - Capital Protection + Full Scaling + Momentum Sniper + Streak Reinvestment + Fast Exit
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -237,6 +237,22 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
     }
   }
 
+  // — Momentum component (0-10 pts) — Profit Hunter: reward live upward momentum
+  if (PROFIT_HUNTER_MODE && tokenInfo) {
+    const m5  = tokenInfo.priceChange5mPercent  || 0;
+    const m1h = tokenInfo.priceChange1hPercent  || 0;
+    let momPts = 0;
+    if (m5 >= 15 && m1h >= 20)      momPts = 10;
+    else if (m5 >= 10 && m1h >= 10) momPts = 8;
+    else if (m5 >= 5  && m1h >= 5)  momPts = 5;
+    else if (m5 > 0   && m1h > 0)   momPts = 2;
+    else if (m5 < 0   || m1h < 0)   momPts = -5; // penalise falling tokens
+    if (momPts !== 0) {
+      score += momPts;
+      reasons.push(`momentum(5m=${m5.toFixed(1)}%,1h=${m1h.toFixed(1)}%→${momPts}pts)`);
+    }
+  }
+
   score = Math.max(0, Math.min(100, score));
 
   // Determine position multiplier
@@ -296,6 +312,10 @@ const safetyState = {
   softSizeMultiplier: 1.0,// 0.4–1.0 progressive loss reduction
 };
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
+const profitHunterState = {
+  consecutiveWins: 0,      // reset on any loss
+  reEntryAllowed: new Set(), // tokens closed at TP — may re-enter
+};
 const tradeHistory = [];
 const seenSignatures = new Set();
 let lastBuyTime = 0; // Cooldown tracker
@@ -340,6 +360,17 @@ const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
 // Tiered take-profit (partial sells)
 const TP_TIER1_PCT             = 75;     // Take 40% off at  +75%
 const TP_TIER2_PCT             = 125;    // Take 40% off at +125% (last 20% runs)
+
+// ─── PROFIT HUNTER MODE ───────────────────────────────────────
+const PROFIT_HUNTER_MODE       = true;
+const PH_FAST_STOP_PCT         = 15;    // Cut position at −15% if still in first 5 min
+const PH_FAST_STOP_WINDOW_MS   = 5 * 60 * 1000;  // 5-min window for fast stop
+const PH_RUN_THRESHOLD_PCT     = 60;    // Above +60% PnL → skip max-hold eviction (let it run)
+const PH_MOMENTUM_5M_MIN       = 5;     // ≥5% 5m change → "hot" token
+const PH_MOMENTUM_1H_MIN       = 10;    // ≥10% 1h change → confirmed trend
+const PH_MOMENTUM_SIZE_BOOST   = 1.40;  // 1.4× size on confirmed momentum signals
+const PH_STREAK_THRESHOLD      = 3;     // 3+ consecutive wins → streak bonus
+const PH_STREAK_CAP_BOOST      = 1.25;  // +25% position cap during streak
 
 function resetDailyCounterIfNeeded() {
   const elapsed = Date.now() - safetyState.dailyStartTime;
@@ -508,13 +539,20 @@ function checkSafetyGates() {
 function recordTradeForSafety(pnlSol, pnlPercent = null) {
   safetyState.dailyPnl += pnlSol;
   if (safetyState.dailyStartBalance === 0) safetyState.dailyStartBalance = portfolio.balance;
-  // Consecutive loss tracking
+  // Consecutive loss/win tracking (safety + profit hunter)
   if (pnlPercent !== null) {
     if (pnlPercent < 0) {
       safetyState.consecutiveLosses++;
+      profitHunterState.consecutiveWins = 0;
       console.log(`   📉 Consecutive losses: ${safetyState.consecutiveLosses}`);
     } else {
       safetyState.consecutiveLosses = 0; // reset on any win
+      if (PROFIT_HUNTER_MODE) {
+        profitHunterState.consecutiveWins++;
+        if (profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD) {
+          console.log(`   🔥 PROFIT HUNTER WIN STREAK: ${profitHunterState.consecutiveWins} in a row!`);
+        }
+      }
     }
   }
 }
@@ -704,6 +742,7 @@ async function getTokenInfo(mintAddress) {
     v24hUSD:              best.volume?.h24 || 0,
     priceChange24hPercent: best.priceChange?.h24 || 0,
     priceChange1hPercent:  best.priceChange?.h1 || 0,
+    priceChange5mPercent:  best.priceChange?.m5  || 0,
     createdAt,
     marketCap:            best.marketCap || 0,
     fdv:                  best.fdv || 0,
@@ -937,6 +976,12 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Safety gates: daily loss limit, drawdown circuit-breaker
   if (!checkSafetyGates()) return false;
 
+  // Profit Hunter re-entry: allow re-buying a previously profitable token
+  if (PROFIT_HUNTER_MODE && profitHunterState.reEntryAllowed.has(tokenMint)) {
+    profitHunterState.reEntryAllowed.delete(tokenMint);
+    console.log(`   ♻️  PH RE-ENTRY: buying back ${symbol || tokenMint.slice(0,8)} (previously profitable)`);
+  }
+
   if (positions.size >= MAX_POSITIONS) {
     console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
     return false;
@@ -1163,6 +1208,14 @@ function evaluatePosition(tokenMint, currentPrice) {
   // Update highest price for trailing stop
   if (currentPrice > highestPrice) {
     position.highestPrice = currentPrice;
+  }
+
+  // PROFIT HUNTER: Fast-cut if down quickly on new entry
+  if (PROFIT_HUNTER_MODE) {
+    const holdMs = Date.now() - position.entryTime;
+    if (holdMs < PH_FAST_STOP_WINDOW_MS && pnlPercent <= -PH_FAST_STOP_PCT) {
+      return { action: 'SELL', reason: `🔴 PH FAST STOP (${holdMs < 60000 ? Math.round(holdMs/1000)+'s' : Math.round(holdMs/60000)+'m'})`, pnlPercent };
+    }
   }
 
   // HARD STOP-LOSS
@@ -1444,7 +1497,25 @@ async function scanNewTokens(connection) {
     const _sqFinalScore = (_sqScore || 0) + _sqAiBoost;
     if (_sqAct === 'SKIP' && _sqAiVerdict !== 'BUY') { console.log(`   ⏭️  QUANT+AI: scanner signal skipped (score=${_sqFinalScore})`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters! (score=${_sqFinalScore} | AI=${_sqAiVerdict})`);
-    const _sqSizeMul = _sqAiBoost >= 15 ? 1.2 : 1.0;
+    // Profit Hunter: momentum boost for hot tokens
+    let _sqSizeMul = _sqAiBoost >= 15 ? 1.2 : 1.0;
+    if (PROFIT_HUNTER_MODE) {
+      const ph5m = info.priceChange5mPercent || 0;
+      const ph1h = info.priceChange1hPercent || 0;
+      if (ph5m >= PH_MOMENTUM_5M_MIN && ph1h >= PH_MOMENTUM_1H_MIN) {
+        _sqSizeMul *= PH_MOMENTUM_SIZE_BOOST;
+        console.log(`   🎯🔥 PROFIT HUNTER BOOST: ${symbol} 5m=${ph5m.toFixed(1)}% 1h=${ph1h.toFixed(1)}% → size ×${_sqSizeMul.toFixed(2)}`);
+      }
+      // Streak reinvestment — if on a hot streak, allow larger cap
+      const streakCapMul = profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD ? PH_STREAK_CAP_BOOST : 1.0;
+      if (streakCapMul > 1.0) console.log(`   🔥 STREAK BONUS: ${profitHunterState.consecutiveWins} wins → cap ×${streakCapMul}`);
+      const capSol = MAX_POSITION_SIZE_SOL * streakCapMul;
+      const tradeSize = Math.min(capSol * _sqMul * _sqSizeMul, portfolio.balance * 0.20);
+      console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
+      const bought = await buyToken(connection, addr, tradeSize, symbol);
+      if (bought) break;
+      continue;
+    }
     const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul * _sqSizeMul, portfolio.balance * 0.18);
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
     const bought = await buyToken(connection, addr, tradeSize, symbol);
@@ -1485,7 +1556,9 @@ async function monitorPositions(connection) {
 
     // Force exit after 30 minutes regardless (memecoin alpha decays fast)
     const holdTime = Math.round((Date.now() - position.entryTime) / 60000);
-    if (holdTime > 30 && result.action !== 'SELL') {
+    // PROFIT HUNTER: Let runners run — don't evict if up > PH_RUN_THRESHOLD_PCT
+    const runnerException = PROFIT_HUNTER_MODE && result.pnlPercent >= PH_RUN_THRESHOLD_PCT;
+    if (holdTime > 30 && result.action !== 'SELL' && !runnerException) {
       console.log(`   ⏰ ${position.symbol} held ${holdTime}m — force-closing (max hold exceeded)`);
       await sellToken(connection, mint, '⏰ MAX HOLD TIME', currentPrice);
       continue;
@@ -1496,6 +1569,11 @@ async function monitorPositions(connection) {
       continue; // Don't remove position — it's still open
     }
     if (result.action === 'SELL') {
+      // Profit Hunter: track profitable exits for potential re-entry
+      if (PROFIT_HUNTER_MODE && result.pnlPercent > 20) {
+        profitHunterState.reEntryAllowed.add(mint);
+        console.log(`   ♻️  PH RE-ENTRY: ${position.symbol} marked for potential re-entry`);
+      }
       await sellToken(connection, mint, result.reason, currentPrice);
     } else {
       console.log(`   ${result.reason} ${position.symbol} | PnL: ${result.pnlPercent > 0 ? '+' : ''}${result.pnlPercent.toFixed(1)}% | ${holdTime}m`);
