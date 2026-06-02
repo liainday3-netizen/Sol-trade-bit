@@ -250,7 +250,14 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
 }
 
 // === STATE ===
-const portfolio = { balance: 0, totalPnl: 0 };
+const portfolio = { balance: 0, totalPnl: 0, startingBalance: 0 };
+const safetyState = {
+  dailyStartBalance: 0,   // reset at midnight
+  dailyPnl: 0,
+  dailyStartTime: Date.now(),
+  haltedUntil: 0,         // timestamp — circuit breaker
+  tradesHalted: false,
+};
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
 const tradeHistory = [];
 const seenSignatures = new Set();
@@ -264,6 +271,105 @@ const CONSENSUS_THRESHOLD = 1;
 // === SELF-LEARNING STATE ===
 const kolScores = new Map();     // wallet -> { trades, wins, totalPnl }
 const candidateKols = new Map(); // wallet -> { hits, seenTokens }
+
+// ══════════════════════════════════════════════════════════════
+// === SAFETY CAPITAL SCALE ENGINE ===
+// ══════════════════════════════════════════════════════════════
+// Position size = balance × BASE_RISK_PCT, capped at hard limits
+const BASE_RISK_PCT    = 0.08;   // 8% of balance per trade (default)
+const MIN_POSITION_SOL = 0.008;  // Never trade less than this
+const MAX_POSITION_SOL = 0.05;   // Hard cap regardless of balance
+const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
+const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
+const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
+
+function resetDailyCounterIfNeeded() {
+  const elapsed = Date.now() - safetyState.dailyStartTime;
+  if (elapsed > 24 * 60 * 60 * 1000) {
+    safetyState.dailyStartBalance = portfolio.balance;
+    safetyState.dailyPnl = 0;
+    safetyState.dailyStartTime = Date.now();
+    console.log('📅 Daily safety counters reset');
+  }
+}
+
+function getScaledPositionSize(quantMultiplier = 1.0) {
+  resetDailyCounterIfNeeded();
+
+  const bal = portfolio.balance;
+  if (bal <= 0) return 0;
+
+  // Base size: 8% of current balance, scaled by quant signal quality
+  let size = bal * BASE_RISK_PCT * quantMultiplier;
+
+  // Apply hard bounds
+  size = Math.max(MIN_POSITION_SOL, Math.min(MAX_POSITION_SOL, size));
+
+  // Conservative mode: if portfolio shrank from start, reduce to 6%
+  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.85) {
+    size = bal * 0.06 * quantMultiplier;
+    size = Math.max(MIN_POSITION_SOL, Math.min(size, MAX_POSITION_SOL * 0.6));
+    console.log(`   🛡️  CONSERVATIVE MODE: balance down from start → ${size.toFixed(4)} SOL`);
+  }
+
+  // Profit mode: if up >50% from start, take slightly smaller risk (protect gains)
+  if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 1.5) {
+    size = Math.min(size, bal * 0.05 * quantMultiplier);
+    console.log(`   📈  PROFIT PROTECT: portfolio up 50%+ → capping position at ${size.toFixed(4)} SOL`);
+  }
+
+  // Reserve guard: never risk more than (balance - reserve - other open positions)
+  const inPositions = positions.size * (bal / Math.max(positions.size + 1, 1));
+  const free = bal - MIN_BALANCE_RESERVE - inPositions;
+  if (size > free * 0.5) size = Math.max(MIN_POSITION_SOL, free * 0.5);
+
+  return parseFloat(size.toFixed(4));
+}
+
+function checkSafetyGates() {
+  resetDailyCounterIfNeeded();
+
+  // 1. Circuit-breaker recovery check
+  if (safetyState.haltedUntil > 0 && Date.now() > safetyState.haltedUntil) {
+    safetyState.haltedUntil = 0;
+    safetyState.tradesHalted = false;
+    console.log('✅ SAFETY: Circuit-breaker cooldown over — trading resumed');
+  }
+  if (safetyState.tradesHalted) {
+    const remaining = Math.round((safetyState.haltedUntil - Date.now()) / 60000);
+    console.log(`   🔴 SAFETY HALT: ${remaining}m remaining`);
+    return false;
+  }
+
+  // 2. Daily loss limit
+  if (safetyState.dailyStartBalance > 0) {
+    const dailyLoss = (safetyState.dailyStartBalance - portfolio.balance) / safetyState.dailyStartBalance;
+    if (dailyLoss >= DAILY_LOSS_LIMIT) {
+      console.log(`   🚨 DAILY LOSS LIMIT (${(dailyLoss*100).toFixed(1)}% ≥ ${DAILY_LOSS_LIMIT*100}%) — halting for 3h`);
+      safetyState.tradesHalted = true;
+      safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
+      return false;
+    }
+  }
+
+  // 3. Drawdown circuit-breaker
+  if (portfolio.startingBalance > 0) {
+    const drawdown = (portfolio.startingBalance - portfolio.balance) / portfolio.startingBalance;
+    if (drawdown >= DRAWDOWN_LIMIT) {
+      console.log(`   🚨 DRAWDOWN LIMIT (${(drawdown*100).toFixed(1)}% ≥ ${DRAWDOWN_LIMIT*100}%) — halting for 3h`);
+      safetyState.tradesHalted = true;
+      safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function recordTradeForSafety(pnlSol) {
+  safetyState.dailyPnl += pnlSol;
+  if (safetyState.dailyStartBalance === 0) safetyState.dailyStartBalance = portfolio.balance;
+}
 
 function getKolScore(wallet) {
   const s = kolScores.get(wallet);
@@ -665,16 +771,19 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
 }
 
 async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWallets = new Set()) {
-  // Dynamic position sizing based on KOL accuracy score
-  if (triggeringWallets.size > 0) {
-    const dynamicSize = getDynamicPositionSize(triggeringWallets);
-    if (dynamicSize !== solAmount) {
-      const avgScore = (Array.from(triggeringWallets).reduce((a,w) => a + getKolScore(w), 0) / triggeringWallets.size * 100).toFixed(0);
-      console.log(`   🧠 DYNAMIC SIZE: ${solAmount.toFixed(4)} → ${dynamicSize.toFixed(4)} SOL (KOL avg score: ${avgScore}%)`);
-      solAmount = dynamicSize;
+  // Safety capital scale: override any passed-in size with scaled amount
+  {
+    const quantMul = 1.0; // quant multiplier already applied by caller
+    const safeSize = getScaledPositionSize(quantMul);
+    if (Math.abs(safeSize - solAmount) > 0.001) {
+      console.log(`   🛡️  CAPITAL SCALE: ${solAmount.toFixed(4)} → ${safeSize.toFixed(4)} SOL (${(portfolio.balance*100).toFixed(1)}% balance = ${(safeSize/portfolio.balance*100).toFixed(1)}% risk)`);
     }
+    solAmount = safeSize;
   }
   console.log(`   🔍 buyToken: ${symbol || tokenMint.slice(0,12)} | ${solAmount} SOL | positions=${positions.size}/${MAX_POSITIONS} | balance=${portfolio.balance.toFixed(4)} | cooldown=${Math.max(0, Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime))/1000))}s`);
+  // Safety gates: daily loss limit, drawdown circuit-breaker
+  if (!checkSafetyGates()) return false;
+
   if (positions.size >= MAX_POSITIONS) {
     console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
     return false;
@@ -833,6 +942,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
     positions.delete(tokenMint);
     logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
     console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
+    recordTradeForSafety(pnlSol);
     const _closedTrade_p = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
     recordPatternOutcome(_closedTrade_p);
     saveMemory(_closedTrade_p);
@@ -878,6 +988,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   }
   logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
   console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+  recordTradeForSafety(pnlSol);
   const _closedTrade_l = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, tx: signature, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
   recordPatternOutcome(_closedTrade_l);
   saveMemory(_closedTrade_l);
@@ -1171,6 +1282,10 @@ function showStatus() {
     if (cands) console.log(`🔭 Candidates: ${cands}`);
   }
   console.log(`📋 Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size} | Pending signals: ${kolSignals.size}`);
+  const _dailyPnlSol = portfolio.balance - safetyState.dailyStartBalance;
+  const _drawdown = portfolio.startingBalance > 0 ? ((portfolio.startingBalance - portfolio.balance) / portfolio.startingBalance * 100).toFixed(1) : '0.0';
+  const _safetyStatus = safetyState.tradesHalted ? '🔴 HALTED' : '🟢 ACTIVE';
+  console.log(`🛡️  Safety: ${_safetyStatus} | Daily PnL: ${_dailyPnlSol >= 0 ? '+' : ''}${_dailyPnlSol.toFixed(4)} SOL | Drawdown: ${_drawdown}% | Pos size: ${getScaledPositionSize().toFixed(4)} SOL (${(getScaledPositionSize()/portfolio.balance*100).toFixed(1)}% bal)`);
   console.log(`${'═'.repeat(50)}\n`);
 }
 
@@ -1182,6 +1297,9 @@ async function main() {
   const pubkey = new PublicKey(WALLET);
   const balance = await connection.getBalance(pubkey);
   portfolio.balance = balance / LAMPORTS_PER_SOL;
+  portfolio.startingBalance = portfolio.balance;
+  safetyState.dailyStartBalance = portfolio.balance;
+  safetyState.dailyStartTime = Date.now();
 
   await loadMemory();
 
