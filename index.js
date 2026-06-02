@@ -318,10 +318,35 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   const mint     = new PublicKey(tokenMint);
   const lamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
 
+  // ATA program (no spl-token dep needed — derive manually)
+  const ATA_PROGRAM = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bB8');
+
+  const getATA = (owner, mint, allowOwnerOffCurve, tokenProg) => {
+    const [ata] = PublicKey.findProgramAddressSync(
+      [owner.toBuffer(), tokenProg.toBuffer(), mint.toBuffer()],
+      ATA_PROGRAM
+    );
+    return ata;
+  };
+
+  const createATAIx = (payer, ata, owner, mint, tokenProg) =>
+    new TransactionInstruction({
+      programId: ATA_PROGRAM,
+      keys: [
+        { pubkey: payer,              isSigner: true,  isWritable: true  },
+        { pubkey: ata,                isSigner: false, isWritable: true  },
+        { pubkey: owner,              isSigner: false, isWritable: false },
+        { pubkey: mint,               isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: tokenProg,          isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from([1]),  // idempotent create
+    });
+
   // Derive PDAs
-  const [globalPDA]        = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
-  const [bondingCurve]     = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
-  const [eventAuthority]   = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
+  const [globalPDA]      = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
+  const [bondingCurve]   = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
+  const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
 
   // Read bonding curve account
   const bcInfo = await connection.getAccountInfo(bondingCurve);
@@ -337,13 +362,13 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
 
   // Calculate expected tokens out: tokens = vTokenRes * lamports / (vSolRes + lamports)
   const tokensOut  = (virtualTokenReserves * lamports) / (virtualSolReserves + lamports);
-  // Use 95% of expected tokens as amount (slippage buffer) and generous maxSolCost (+10%)
+  // Use 95% of expected tokens (slippage tolerance) and +10% maxSolCost buffer
   const amount     = tokensOut * 95n / 100n;
   const maxSolCost = lamports * 110n / 100n;
 
   // Get creator from bonding curve state (offset 49), derive creatorVault
-  const creator               = new PublicKey(buf.slice(49, 81));
-  const [creatorVault]        = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
+  const creator        = new PublicKey(buf.slice(49, 81));
+  const [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
 
   // Read fee recipient from global state (offset 41)
   let feeRecipient;
@@ -355,23 +380,20 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
     feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
   }
 
-  // Determine token program (SPL vs Token-2022)
-  const mintInfo    = await connection.getAccountInfo(mint);
-  const tokenProg   = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
+  // Determine token program (SPL vs Token-2022) from mint account owner
+  const mintInfo  = await connection.getAccountInfo(mint);
+  const tokenProg = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
 
-  // Compute ATAs
-  const { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction } = await import('@solana/spl-token');
-  const associatedBondingCurve = getAssociatedTokenAddressSync(mint, bondingCurve, true, tokenProg);
-  const associatedUser         = getAssociatedTokenAddressSync(mint, keypair.publicKey, false, tokenProg);
+  // Compute ATAs (manual — no @solana/spl-token needed)
+  const associatedBondingCurve = getATA(bondingCurve, mint, true, tokenProg);
+  const associatedUser         = getATA(keypair.publicKey, mint, false, tokenProg);
 
   const ixs = [];
 
-  // Create user ATA if it doesn't exist yet
+  // Create user ATA if it doesn't exist yet (idempotent ix handles race conditions)
   const userAtaInfo = await connection.getAccountInfo(associatedUser);
   if (!userAtaInfo) {
-    ixs.push(createAssociatedTokenAccountInstruction(
-      keypair.publicKey, associatedUser, keypair.publicKey, mint, tokenProg
-    ));
+    ixs.push(createATAIx(keypair.publicKey, associatedUser, keypair.publicKey, mint, tokenProg));
   }
 
   // Build buy instruction: discriminator(8) + amount(u64) + maxSolCost(u64)
@@ -416,7 +438,6 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
       preflightCommitment: 'confirmed',
     });
     console.log(`   ✅ Pump.fun bonding curve buy sent: ${sig.slice(0, 16)}...`);
-    // Return enough for position tracking
     return { sig, tokensOut: Number(tokensOut) / 1e6, price: solAmount / (Number(tokensOut) / 1e6) };
   } catch (e) {
     console.log(`   ❌ Pump.fun direct buy failed: ${e.message?.slice(0, 100)}`);
