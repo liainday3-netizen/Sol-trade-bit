@@ -1,4 +1,4 @@
-// SOL BOT v8.2 PROFIT HUNTER - Ghost-liquidity bypass: catch pump.fun rockets before DexScreener indexes them
+// SOL BOT v8.3 PROFIT HUNTER - Fix pump.fun owner check + ghost-liq scanner continue on failure
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -919,6 +919,12 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   const bcInfo = await connection.getAccountInfo(bondingCurve);
   if (!bcInfo) { console.log('   ❌ Not a pump.fun token (no bonding curve)'); return null; }
 
+  // Verify owner — if it's a different program, skip silently to avoid simulation errors
+  if (!bcInfo.owner.equals(PUMP_PROGRAM)) {
+    console.log(`   ⚠️  Bonding curve account exists but is owned by ${bcInfo.owner.toBase58().slice(0,16)}... (not pump.fun) — skipping direct route`);
+    return null;
+  }
+
   const buf = bcInfo.data;
   // Layout: discriminator(8) | virtualTokenReserves(8) | virtualSolReserves(8) |
   //         realTokenReserves(8) | realSolReserves(8) | tokenTotalSupply(8) | complete(1) | creator(32)
@@ -934,8 +940,16 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   const maxSolCost = lamports * 110n / 100n;
 
   // Get creator from bonding curve state (offset 49), derive creatorVault
-  const creator        = new PublicKey(buf.slice(49, 81));
-  const [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
+  // Layout: disc(8)+vTokRes(8)+vSolRes(8)+realTokRes(8)+realSolRes(8)+totalSup(8)+complete(1)+creator(32) = 49
+  let creator, creatorVault;
+  try {
+    creator       = new PublicKey(buf.slice(49, 81));
+    [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
+    console.log(`   🔍 pump.fun creator: ${creator.toBase58().slice(0,16)}... vault: ${creatorVault.toBase58().slice(0,16)}...`);
+  } catch (pErr) {
+    console.log(`   ❌ Failed to derive creator/vault PDA (bad bonding curve layout?): ${pErr.message}`);
+    return null;
+  }
 
   // Read fee recipient from global state (offset 41)
   let feeRecipient;
@@ -1548,16 +1562,23 @@ async function scanNewTokens(connection) {
     if (_sqAct === 'SKIP' && _sqAiVerdict !== 'BUY') { console.log(`   ⏭️  QUANT+AI: scanner signal skipped (score=${_sqFinalScore})`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters! (score=${_sqFinalScore} | AI=${_sqAiVerdict})`);
 
-    // Ghost-liquidity tokens: reduced size, pump.fun direct only
+    // Ghost-liquidity tokens: reduced size, pump.fun first → Jupiter fallback
+    // NOTE: use continue (not break) on failure so scanner keeps checking other tokens
     if (isGhostLiq) {
       const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.50, portfolio.balance * 0.10);
       console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → trying pump.fun direct`);
       const ghostBought = await buyPumpFunDirect(connection, addr, ghostSize);
-      if (ghostBought) break;
-      // If pump.fun fails, let Jupiter try below
-      console.log(`   👻 pump.fun direct failed for ${symbol} — trying Jupiter anyway`);
-      await buyToken(connection, addr, ghostSize, symbol);
-      break;
+      if (ghostBought) {
+        console.log(`   ✅ Ghost-liq pump.fun buy succeeded: ${symbol}`);
+        break; // bought — stop scanning this cycle
+      }
+      // pump.fun failed — try Jupiter with high slippage (already has 3%→5%→10% escalation)
+      console.log(`   👻 pump.fun failed for ${symbol} — trying Jupiter high-slippage fallback`);
+      const jupResult = await buyToken(connection, addr, ghostSize, symbol);
+      if (jupResult) break; // bought via Jupiter — stop scanning
+      // Both routes failed — log and try next token in scan
+      console.log(`   ⛔ ${symbol}: all routes failed (ghost-liq unroutable) — scanning next token`);
+      continue;
     }
 
     // Profit Hunter: momentum boost for hot tokens
