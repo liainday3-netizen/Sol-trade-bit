@@ -1,4 +1,4 @@
-// SOL BOT v9.3 - Rate limit fix: BC cache (90s TTL), safeFetch 429 backoff, zero duplicate RPC calls
+// SOL BOT v9.5 - Groq AI (free, llama-3.3-70b) replaces OpenAI; RPC cache; sim 429 retry; Jupiter fallback endpoint
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -9,7 +9,7 @@ const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
 const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is set
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const OPENAI_KEY   = process.env.OPENAI_API_KEY || ''; // Optional: enables AI signal layer
+const GROQ_KEY     = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || ''; // Groq (free) preferred; falls back to OpenAI key if present
 const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
 
@@ -28,8 +28,9 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_URL      = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_QUOTE_URL_ALT  = 'https://api.jup.ag/swap/v1/quote';  // fallback endpoint
+const JUPITER_SWAP_URL       = 'https://quote-api.jup.ag/v6/swap';
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -267,9 +268,9 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
   return { score, multiplier, action };
 }
 
-// === AI SIGNAL ANALYSIS (OpenAI — optional, activates when OPENAI_API_KEY is set) ===
+// === AI SIGNAL ANALYSIS (Groq — free tier, OpenAI-compatible; activates when GROQ_API_KEY is set) ===
 async function aiAnalyzeSignal(tokenInfo, source) {
-  if (!OPENAI_KEY || !tokenInfo) return { boost: 0, verdict: 'no-ai' };
+  if (!GROQ_KEY || !tokenInfo) return { boost: 0, verdict: 'no-ai' };
   try {
     const ageH   = tokenInfo.createdAt ? ((Date.now()/1000 - tokenInfo.createdAt)/3600).toFixed(1) : '?';
     const liq    = (tokenInfo.liquidity || 0).toLocaleString();
@@ -305,20 +306,20 @@ async function aiAnalyzeSignal(tokenInfo, source) {
       `Return JSON only (no markdown): { "boost": <integer -10 to 35>, "verdict": "<BUY|SKIP|HOLD>", "reason": "<6 words max>" }`,
     ].join('\n');
 
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }], max_tokens: 100, temperature: 0.1 }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], max_tokens: 100, temperature: 0.1 }),
     });
     const data = await res.json();
     if (!res.ok || data.error) {
       const errMsg = data.error?.message || data.error || `HTTP ${res.status}`;
-      console.log(`   ❌ OpenAI API error: ${errMsg}`);
+      console.log(`   ❌ Groq API error: ${errMsg}`);
       return { boost: 0, verdict: 'api-error' };
     }
     const text = data.choices?.[0]?.message?.content?.trim();
     if (!text) {
-      console.log(`   ⚠️  OpenAI empty response (choices=${JSON.stringify(data.choices?.length)})`);
+      console.log(`   ⚠️  Groq empty response (choices=${JSON.stringify(data.choices?.length)})`);
       return { boost: 0, verdict: 'empty' };
     }
     const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
@@ -386,6 +387,49 @@ async function getBondingCurveInfo(connection, tokenMint) {
   } catch {
     return { hasBondingCurve: false, bcComplete: false, bcInfo: null, ts: Date.now() };
   }
+}
+
+// === PUMP.FUN STATIC ACCOUNT CACHES ===
+// globalInfo: rarely changes (fee recipient slot), 5 min TTL
+// mintInfo: tokenProgram ownership never changes, permanent cache
+// ataInfo: ATA existence — once created stays forever, 60s TTL
+let _globalInfoCache = null;
+let _globalInfoTs = 0;
+const GLOBAL_CACHE_TTL_MS = 300_000; // 5 min
+const mintProgCache = new Map(); // mintPubkeyStr → PublicKey (token program)
+const ataExistsCache = new Map(); // ataStr → { exists, ts }
+const ATA_CACHE_TTL_MS = 60_000;
+
+async function getCachedGlobalInfo(connection, globalPDA) {
+  if (_globalInfoCache && Date.now() - _globalInfoTs < GLOBAL_CACHE_TTL_MS) return _globalInfoCache;
+  try {
+    _globalInfoCache = await connection.getAccountInfo(globalPDA);
+    _globalInfoTs = Date.now();
+    return _globalInfoCache;
+  } catch { return _globalInfoCache; } // use stale on error
+}
+
+async function getCachedTokenProg(connection, mint) {
+  const k = mint.toBase58();
+  if (mintProgCache.has(k)) return mintProgCache.get(k);
+  try {
+    const mintInfo = await connection.getAccountInfo(mint);
+    const prog = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
+    mintProgCache.set(k, prog);
+    return prog;
+  } catch { return TOKEN_SPL_PROGRAM; }
+}
+
+async function getCachedAtaExists(connection, ataKey) {
+  const k = ataKey.toBase58();
+  const cached = ataExistsCache.get(k);
+  if (cached && Date.now() - cached.ts < ATA_CACHE_TTL_MS) return cached.exists;
+  try {
+    const info = await connection.getAccountInfo(ataKey);
+    const exists = !!info;
+    ataExistsCache.set(k, { exists, ts: Date.now() });
+    return exists;
+  } catch { return false; }
 }
 const profitHunterState = {
   consecutiveWins: 0,      // reset on any loss
@@ -725,6 +769,11 @@ async function safeFetch(url, options = {}, _retries = 2) {
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
+    // Retry on network-level failures (DNS, TCP, timeout) — not just 429
+    if (_retries > 0 && (e.code === 'ECONNRESET' || e.code === 'ENOTFOUND' || e.code === 'ETIMEDOUT' || e.message?.includes('fetch failed') || e.message?.includes('terminated'))) {
+      await new Promise(r => setTimeout(r, 1500));
+      return safeFetch(url, options, _retries - 1);
+    }
     return null;
   }
 }
@@ -862,7 +911,8 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBp
     asLegacyTransaction: 'false',
   });
 
-  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`);
+  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`)
+    ?? await safeFetchVerbose(`${JUPITER_QUOTE_URL_ALT}?${params}`, {}, `Jupiter quote alt (${slippage/100}%slip)`);
   if (!quote) return null;
   // Jupiter returns HTTP 200 but with error field when no route exists
   if (quote.error || !quote.outAmount) {
@@ -1097,9 +1147,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
     return null;
   }
 
-  // Read fee recipient from global state (offset 41)
+  // Read fee recipient from global state (offset 41) — cached 5 min
   let feeRecipient;
-  const globalInfo = await connection.getAccountInfo(globalPDA);
+  const globalInfo = await getCachedGlobalInfo(connection, globalPDA);
   if (globalInfo && globalInfo.data.length >= 73) {
     feeRecipient = new PublicKey(globalInfo.data.slice(41, 73));
   } else {
@@ -1107,9 +1157,8 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
     feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
   }
 
-  // Determine token program (SPL vs Token-2022) from mint account owner
-  const mintInfo  = await connection.getAccountInfo(mint);
-  const tokenProg = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
+  // Determine token program (SPL vs Token-2022) — cached permanently (mint owner never changes)
+  const tokenProg = await getCachedTokenProg(connection, mint);
 
   // Compute ATAs (manual — no @solana/spl-token needed)
   const associatedBondingCurve = getATA(bondingCurve, mint, true, tokenProg);
@@ -1121,9 +1170,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
   ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }));
   ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }));
 
-  // Create user ATA if it doesn't exist yet (idempotent ix handles race conditions)
-  const userAtaInfo = await connection.getAccountInfo(associatedUser);
-  if (!userAtaInfo) {
+  // Create user ATA if it doesn't exist yet — cached 60s
+  const ataExists = await getCachedAtaExists(connection, associatedUser);
+  if (!ataExists) {
     ixs.push(createATAIx(keypair.publicKey, associatedUser, keypair.publicKey, mint, tokenProg));
   }
 
@@ -1187,27 +1236,39 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
   const { blockhash } = await connection.getLatestBlockhash('confirmed');
 
   // Try NEW layout first — pre-simulate silently
+  // IMPORTANT: simulateTransaction can THROW (not just return err) when RPC is rate-limited.
+  // Each layout gets its own try/catch so a thrown 429 on layout 1 doesn't kill layout 2.
   let vtx = buildVtx(buildBuyIx(true), blockhash);
   let layoutLabel = 'new (creator-vault)';
 
-  try {
-    const sim = await connection.simulateTransaction(vtx, { replaceRecentBlockhash: true, commitment: 'confirmed' });
-    if (sim.value.err) {
-      // NEW layout failed — fall back to OLD layout
-      console.log(`   ⚠️  pump.fun new layout sim failed (${JSON.stringify(sim.value.err)}) — trying old layout (RENT sysvar)`);
-      vtx = buildVtx(buildBuyIx(false), blockhash);
-      layoutLabel = 'old (RENT sysvar)';
-
-      const sim2 = await connection.simulateTransaction(vtx, { replaceRecentBlockhash: true, commitment: 'confirmed' });
-      if (sim2.value.err) {
-        console.log(`   ❌ pump.fun old layout sim also failed: ${JSON.stringify(sim2.value.err)} — cannot route via bonding curve`);
-        return null;
+  const silentSim = async (tx) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await connection.simulateTransaction(tx, { replaceRecentBlockhash: true, commitment: 'processed' });
+      } catch (e) {
+        if (attempt === 0 && (e.message?.includes('429') || e.message?.includes('Too Many'))) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue; // retry once on 429 throw
+        }
+        return { value: { err: { threw: e.message?.slice(0, 60) } } };
       }
-      console.log(`   ✅ pump.fun old layout sim passed — sending`);
     }
-  } catch (simErr) {
-    console.log(`   ❌ pump.fun pre-sim threw: ${simErr.message?.slice(0, 80)} — skipping direct route`);
-    return null;
+    return { value: { err: { threw: 'max retries' } } };
+  };
+
+  const sim1 = await silentSim(vtx);
+  if (sim1.value.err) {
+    // NEW layout failed — fall back to OLD layout
+    console.log(`   ⚠️  pump.fun new layout sim failed (${JSON.stringify(sim1.value.err)}) — trying old layout (RENT sysvar)`);
+    vtx = buildVtx(buildBuyIx(false), blockhash);
+    layoutLabel = 'old (RENT sysvar)';
+
+    const sim2 = await silentSim(vtx);
+    if (sim2.value.err) {
+      console.log(`   ❌ pump.fun old layout sim also failed: ${JSON.stringify(sim2.value.err)} — cannot route via bonding curve`);
+      return null;
+    }
+    console.log(`   ✅ pump.fun old layout sim passed — sending`);
   }
 
   try {
