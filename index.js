@@ -54,7 +54,7 @@ let lastBuyTime = 0; // Cooldown tracker
 // === CONSENSUS TRACKING ===
 // Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
 const kolSignals = new Map();
-const CONSENSUS_THRESHOLD = 1;        // Single KOL signal is sufficient (was 2 — caused zero trades)
+const CONSENSUS_THRESHOLD = 1;        // Execute on single KOL signal (only Jijo is active)
 const CONSENSUS_WINDOW = 300000;      // Within 5 minutes of each other
 
 // === WALLET KEYPAIR (for live trading) ===
@@ -124,8 +124,12 @@ async function getTokenPrice(mintAddress) {
       solUsd = cgData?.solana?.usd;
     }
     if (!solUsd) {
+      const bnSol = await safeFetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+      solUsd = bnSol?.price ? parseFloat(bnSol.price) : null;
+    }
+    if (!solUsd) {
       const jupSol = await safeFetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
-      solUsd = jupSol?.data?.[SOL_MINT]?.price;
+      solUsd = jupSol?.data?.[SOL_MINT]?.price ? parseFloat(jupSol.data[SOL_MINT].price) : null;
     }
     solUsd = solUsd || 85; // Last resort hardcoded fallback
     const quote = await safeFetch(
@@ -677,13 +681,18 @@ async function main() {
       const cgData = await safeFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
       solUsdPrice = cgData?.solana?.usd;
     }
-    // Fallback: Jupiter price API
+    // Fallback: Binance public API (no key, most reliable)
+    if (!solUsdPrice) {
+      const bnData = await safeFetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+      solUsdPrice = bnData?.price ? parseFloat(bnData.price) : null;
+    }
+    // Fallback: Jupiter price API v2
     if (!solUsdPrice) {
       const jupData = await safeFetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
-      solUsdPrice = jupData?.data?.[SOL_MINT]?.price;
+      solUsdPrice = jupData?.data?.[SOL_MINT]?.price ? parseFloat(jupData.data[SOL_MINT].price) : null;
     }
     if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
-      console.log(`   SOL: ${solUsdPrice.toFixed(2)}`);
+      console.log(`   SOL: ${parseFloat(solUsdPrice).toFixed(2)}`);
     } else {
       console.log(`   SOL: price unavailable from all sources`);
     }
