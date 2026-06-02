@@ -408,7 +408,7 @@ async function monitorCopyWallets(connection) {
   for (const walletAddr of COPY_WALLETS) {
     try {
       const pubkey = new PublicKey(walletAddr);
-      const signatures = await connection.getSignaturesForAddress(pubkey, { limit: 5 });
+      const signatures = await connection.getSignaturesForAddress(pubkey, { limit: 20 });
 
       for (const sig of signatures) {
         if (seenSignatures.has(sig.signature)) continue;
@@ -426,6 +426,13 @@ async function monitorCopyWallets(connection) {
             const txDetail = await connection.getParsedTransaction(sig.signature, {
               maxSupportedTransactionVersion: 0,
             });
+
+            // Skip TXs not initiated by this KOL (e.g. spam ATA creation by bots)
+            const feePayer = txDetail?.transaction?.message?.accountKeys?.[0]?.pubkey;
+            if (feePayer !== walletAddr) {
+              console.log(`   ⏭️  Skipping TX — not initiated by this KOL (fee payer: ${feePayer?.slice(0,8)}...)`);
+              continue;
+            }
 
             if (txDetail?.meta?.postTokenBalances && txDetail?.meta?.preTokenBalances) {
               const pre = txDetail.meta.preTokenBalances;
