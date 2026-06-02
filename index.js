@@ -228,6 +228,7 @@ async function executeJupiterSwap(connection, quote) {
 
 // === BUY TOKEN (Jupiter) ===
 async function buyToken(connection, tokenMint, solAmount, symbol) {
+  console.log(`   🔍 buyToken: ${symbol || tokenMint.slice(0,12)} | ${solAmount} SOL | positions=${positions.size}/${MAX_POSITIONS} | balance=${portfolio.balance.toFixed(4)} | cooldown=${Math.max(0, Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime))/1000))}s`);
   if (positions.size >= MAX_POSITIONS) {
     console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
     return false;
@@ -275,13 +276,19 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
   // === LIVE TRADE ===
   console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
   const quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
-  if (!quote) return false;
+  if (!quote) {
+    console.log(`   ❌ TRADE BLOCKED: Jupiter could not quote ${symbol || tokenMint.slice(0,12)} — no route (new token or low liquidity pool)`);
+    return false;
+  }
 
   const expectedOut = parseInt(quote.outAmount);
   console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
 
   const signature = await executeJupiterSwap(connection, quote);
-  if (!signature) return false;
+  if (!signature) {
+    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
+    return false;
+  }
 
   // Record position
   const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 9)); // Adjust decimals
@@ -344,7 +351,10 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   console.log(`   📊 Quote: ${expectedSolBack.toFixed(4)} SOL back`);
 
   const signature = await executeJupiterSwap(connection, quote);
-  if (!signature) return false;
+  if (!signature) {
+    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
+    return false;
+  }
 
   // Update portfolio
   const pnlSol = expectedSolBack - position.solInvested;
