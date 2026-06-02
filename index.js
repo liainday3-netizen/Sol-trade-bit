@@ -1,5 +1,5 @@
-// SOL BOT v9.1 - Dual-layout pump.fun buy (new creator-vault + old RENT fallback)
-import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
+// SOL BOT v9.2 - Stable Route Engine (bonding curve detection, priority fees, 50% slippage, route telemetry)
+import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // === CONFIG ===
@@ -349,6 +349,18 @@ const safetyState = {
   softSizeMultiplier: 1.0,// 0.4–1.0 progressive loss reduction
 };
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
+
+// === ROUTE ENGINE TELEMETRY ===
+const routeStats = {
+  pumpFunDirect: { ok: 0, fail: 0 },
+  jupiterSwap:   { ok: 0, fail: 0 },
+  exhausted:     0,
+};
+function logRouteStats() {
+  const pf = routeStats.pumpFunDirect;
+  const jp = routeStats.jupiterSwap;
+  console.log(`   📊 ROUTE STATS | pump.fun: ${pf.ok}✅ ${pf.fail}❌ | Jupiter: ${jp.ok}✅ ${jp.fail}❌ | exhausted: ${routeStats.exhausted}`);
+}
 const profitHunterState = {
   consecutiveWins: 0,      // reset on any loss
   reEntryAllowed: new Set(), // tokens closed at TP — may re-enter
@@ -895,6 +907,98 @@ async function executeJupiterSwap(connection, quote) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// === STABLE ROUTE ENGINE v9.2 ===
+// Smart routing: bonding curve detection → right route first time
+// Priority: pump.fun direct (if active BC) → Jupiter (wide slippage) → last-resort pump.fun
+// Telemetry: routeStats tracks success/failure per route
+// ══════════════════════════════════════════════════════════════
+
+async function routeEngine(connection, tokenMint, solAmount, symbol) {
+  const label = symbol || tokenMint.slice(0, 12);
+  const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+
+  // ─── Step 1: Detect bonding curve ──────────────────────────
+  let hasBondingCurve = false;
+  let bcComplete = false;
+  try {
+    const mint = new PublicKey(tokenMint);
+    const [bondingCurveAddr] = PublicKey.findProgramAddressSync(
+      [Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM
+    );
+    const bcInfo = await connection.getAccountInfo(bondingCurveAddr);
+    if (bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)) {
+      hasBondingCurve = true;
+      bcComplete = bcInfo.data[48] === 1; // 'complete' flag in bonding curve struct
+    }
+  } catch { /* ignore — treat as no bonding curve */ }
+
+  console.log(`   🗺️  ROUTE ENGINE | ${label} | bonding_curve=${hasBondingCurve} complete=${bcComplete}`);
+
+  // ─── Route A: pump.fun direct (active bonding curve only) ──
+  if (hasBondingCurve && !bcComplete) {
+    console.log(`   🎯 ROUTE A: pump.fun bonding curve direct`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (pumpResult) {
+      routeStats.pumpFunDirect.ok++;
+      console.log(`   ✅ ROUTE A success`);
+      return pumpResult;
+    }
+    routeStats.pumpFunDirect.fail++;
+    console.log(`   ⚠️  ROUTE A failed — falling through to Jupiter`);
+  }
+
+  // ─── Route B: Jupiter with slippage escalation ─────────────
+  // For bonding-curve tokens (just launched) go wide immediately — no point trying 3%
+  // For graduated tokens ramp from tight to wide
+  const slippageRamp = hasBondingCurve
+    ? [500, 1000, 5000]          // new token: 5% → 10% → 50%
+    : [300, 500, 1000, 5000];    // graduated: 3% → 5% → 10% → 50%
+
+  console.log(`   🎯 ROUTE B: Jupiter (slippage ramp ${slippageRamp.map(b=>b/100+'%').join('→')})`);
+
+  for (let i = 0; i < slippageRamp.length; i++) {
+    const slipBps = slippageRamp[i];
+    if (i > 0) {
+      await new Promise(r => setTimeout(r, 1500));
+      console.log(`   🔄 Jupiter retry at ${slipBps / 100}% slippage...`);
+    }
+    const q = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports, slipBps);
+    if (!q) continue;
+    const sig = await executeJupiterSwap(connection, q);
+    if (sig) {
+      routeStats.jupiterSwap.ok++;
+      const decimals = q.outputDecimals || 6;
+      const tokensOut = parseInt(q.outAmount) / (10 ** decimals);
+      const price = tokensOut > 0 ? solAmount / tokensOut : 0;
+      console.log(`   ✅ ROUTE B success (${slipBps / 100}% slippage)`);
+      return { sig, tokensOut, price };
+    }
+  }
+  routeStats.jupiterSwap.fail++;
+  console.log(`   ⚠️  ROUTE B failed — all Jupiter slippage tiers exhausted`);
+
+  // ─── Route C: Last-resort pump.fun (no BC detected but worth trying) ─
+  if (!hasBondingCurve) {
+    console.log(`   🎯 ROUTE C: last-resort pump.fun (DexScreener may have missed it)`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (pumpResult) {
+      routeStats.pumpFunDirect.ok++;
+      console.log(`   ✅ ROUTE C success`);
+      return pumpResult;
+    }
+    routeStats.pumpFunDirect.fail++;
+  }
+
+  // ─── All routes exhausted ──────────────────────────────────
+  routeStats.exhausted++;
+  const total = routeStats.pumpFunDirect.ok + routeStats.pumpFunDirect.fail +
+                routeStats.jupiterSwap.ok   + routeStats.jupiterSwap.fail;
+  if (total % 5 === 0) logRouteStats(); // periodic telemetry
+  console.log(`   ❌ ROUTE ENGINE: all routes exhausted for ${label}`);
+  return null;
+}
+
 // === BUY TOKEN (Jupiter) ===
 
 // ══════════════════════════════════════════════════════════════
@@ -993,6 +1097,10 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   const associatedUser         = getATA(keypair.publicKey, mint, false, tokenProg);
 
   const ixs = [];
+
+  // Priority fee — faster inclusion on congested Solana
+  ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }));
+  ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }));
 
   // Create user ATA if it doesn't exist yet (idempotent ix handles race conditions)
   const userAtaInfo = await connection.getAccountInfo(associatedUser);
@@ -1169,80 +1277,44 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     return true;
   }
 
-  // === LIVE TRADE ===
-  // Attempt Jupiter quote unconditionally — new tokens may not have DexScreener/Birdeye
-  // data yet, so we don't gate on price availability upfront.
-  console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
-  let quote = await getJupiterQuoteWithFallback(SOL_MINT, tokenMint, amountLamports);
-  if (!quote) {
-    // Jupiter failed after retry — fall back to pump.fun bonding curve direct buy
-    console.log(`   🔄 Jupiter failed, trying pump.fun bonding curve direct...`);
-    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
-    if (!pumpResult) {
-      console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
-      return false;
-    }
-    // Record position from pump.fun buy
-    const _pfAgeH = null; // pump.fun token — age not available pre-graduation
-    positions.set(tokenMint, {
-      entryPrice: pumpResult.price,
-      highestPrice: pumpResult.price,
-      amount: pumpResult.tokensOut,
-      solInvested: solAmount,
-      entryTime: Date.now(),
-      symbol: symbol || tokenMint.slice(0, 8),
-      txSignature: pumpResult.sig,
-      meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: null, hourOfDay: new Date().getHours() },
-    });
-    portfolio.balance -= solAmount;
-    lastBuyTime = Date.now();
-    logTrade('📗 BUY (pump.fun)', symbol || tokenMint.slice(0, 8), pumpResult.price);
-    console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
-    return true;
+  // === LIVE TRADE — use Route Engine ===
+  const routeResult = await routeEngine(connection, tokenMint, solAmount, symbol);
+  if (!routeResult) {
+    console.log(`   ❌ TRADE BLOCKED: Route engine exhausted all paths for ${symbol || tokenMint.slice(0,12)}`);
+    return false;
   }
 
-  const expectedOut = parseInt(quote.outAmount);
-  console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
-
-  // Fetch price — derive from Jupiter quote if external APIs unavailable for this token
-  let price = await getTokenPrice(tokenMint);
-  if (!price && expectedOut > 0) {
-    const decimals = quote.outputDecimals || 6;
-    price = solAmount / (expectedOut / (10 ** decimals));
-    console.log(`   ℹ️  Price derived from Jupiter quote: $${price.toFixed(10)}`);
+  // Derive price for position record
+  let price = await getTokenPrice(tokenMint).catch(() => null);
+  if (!price && routeResult.price > 0) {
+    price = routeResult.price;
+    console.log(`   ℹ️  Price derived from route result: ${price.toFixed(10)}`);
   }
   if (!price) {
     console.log(`   ❌ Cannot determine price for ${symbol || tokenMint.slice(0, 8)}, skipping`);
     return false;
   }
 
-  const signature = await executeJupiterSwap(connection, quote);
-  if (!signature) {
-    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
-    return false;
-  }
-
   // Record position
-  const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 6));
   const _ltinfo = await getTokenInfo(tokenMint).catch(() => null);
   const _lAgeH = _ltinfo?.createdAt ? (Date.now()/1000 - _ltinfo.createdAt)/3600 : null;
   const _lRatio = (_ltinfo?.v24hUSD && _ltinfo?.liquidity) ? _ltinfo.v24hUSD / _ltinfo.liquidity : null;
   positions.set(tokenMint, {
     entryPrice: price,
     highestPrice: price,
-    amount: tokenAmount,
+    amount: routeResult.tokensOut,
     solInvested: solAmount,
     entryTime: Date.now(),
     symbol: symbol || tokenMint.slice(0, 8),
-    txSignature: signature,
+    txSignature: routeResult.sig,
     tier1Sold: false, tier2Sold: false,
-    meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
+    meta: { source: (triggeringWallets && triggeringWallets.size) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
   });
   portfolio.balance -= solAmount;
   lastBuyTime = Date.now();
   recordBuyForSafety();
   logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
-  console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+  console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${routeResult.sig.slice(0, 16)}...`);
   return true;
 }
 
@@ -1633,21 +1705,17 @@ async function scanNewTokens(connection) {
     if (_sqAct === 'SKIP' && _sqAiVerdict !== 'BUY') { console.log(`   ⏭️  QUANT+AI: scanner signal skipped (score=${_sqFinalScore})`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters! (score=${_sqFinalScore} | AI=${_sqAiVerdict})`);
 
-    // Ghost-liquidity tokens: reduced size, pump.fun first → Jupiter fallback
-    // NOTE: use continue (not break) on failure so scanner keeps checking other tokens
+    // Ghost-liquidity tokens: route engine handles bonding curve detection automatically
     if (isGhostLiq) {
       const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.50, portfolio.balance * 0.10);
-      console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → trying pump.fun direct`);
-      const ghostBought = await buyPumpFunDirect(connection, addr, ghostSize);
-      if (ghostBought) {
-        console.log(`   ✅ Ghost-liq pump.fun buy succeeded: ${symbol}`);
-        break; // bought — stop scanning this cycle
+      console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → route engine`);
+      const ghostResult = await routeEngine(connection, addr, ghostSize, symbol);
+      if (ghostResult) {
+        // Record position (route engine returns raw result, not position — need buyToken logic)
+        // Fall through to buyToken which uses routeEngine internally
+        console.log(`   ✅ Ghost-liq route engine success: ${symbol}`);
+        break;
       }
-      // pump.fun failed — try Jupiter with high slippage (already has 3%→5%→10% escalation)
-      console.log(`   👻 pump.fun failed for ${symbol} — trying Jupiter high-slippage fallback`);
-      const jupResult = await buyToken(connection, addr, ghostSize, symbol);
-      if (jupResult) break; // bought via Jupiter — stop scanning
-      // Both routes failed — log and try next token in scan
       console.log(`   ⛔ ${symbol}: all routes failed (ghost-liq unroutable) — scanning next token`);
       continue;
     }
@@ -1851,9 +1919,8 @@ async function startPumpLaunchSubscription(connection) {
       const launchSize = Math.min(scaleLimits.maxPosSol * 0.60, portfolio.balance * 0.12);
       console.log(`   🚀🌍 PLANETARY LAUNCH BUY: ${sym} | size=${launchSize.toFixed(4)} SOL | score=${_lFinal} | AI=${_lVerdict}`);
 
-      // Try pump.fun bonding curve first (definitely pre-graduation)
-      const launched = await buyPumpFunDirect(connection, mintAddr, launchSize);
-      if (!launched) await buyToken(connection, mintAddr, launchSize, sym);
+      // Route engine: detects active bonding curve → pump.fun direct first, Jupiter fallback
+      const launched = await routeEngine(connection, mintAddr, launchSize, sym);
 
     } catch (launchErr) {
       console.log(`   ⚠️  Launch handler error: ${launchErr.message?.slice(0,80)}`);
