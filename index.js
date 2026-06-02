@@ -1,5 +1,5 @@
 // SOL BOT v5.1 - Copy Trading + Jupiter Swap Execution + Risk Management
-import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // === CONFIG ===
@@ -26,6 +26,12 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
 const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
+
+// === PUMP.FUN BONDING CURVE CONSTANTS ===
+const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+const TOKEN_SPL_PROGRAM  = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 
 // === TOP KOL WALLETS TO COPY (Verified April 2026 - MadeOnSol data) ===
 // Source: https://madeonsol.com/blog/top-solana-kol-wallets-to-copy-trade
@@ -300,6 +306,124 @@ async function executeJupiterSwap(connection, quote) {
 }
 
 // === BUY TOKEN (Jupiter) ===
+
+// ══════════════════════════════════════════════════════════════
+// === PUMP.FUN BONDING CURVE DIRECT BUY ===
+// Used when Jupiter can't route (token still on bonding curve pre-migration)
+// ══════════════════════════════════════════════════════════════
+
+async function buyPumpFunDirect(connection, tokenMint, solAmount) {
+  if (!keypair) { console.log('   ❌ No keypair for pump.fun buy'); return null; }
+
+  const mint     = new PublicKey(tokenMint);
+  const lamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
+
+  // Derive PDAs
+  const [globalPDA]        = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
+  const [bondingCurve]     = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
+  const [eventAuthority]   = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
+
+  // Read bonding curve account
+  const bcInfo = await connection.getAccountInfo(bondingCurve);
+  if (!bcInfo) { console.log('   ❌ Not a pump.fun token (no bonding curve)'); return null; }
+
+  const buf = bcInfo.data;
+  // Layout: discriminator(8) | virtualTokenReserves(8) | virtualSolReserves(8) |
+  //         realTokenReserves(8) | realSolReserves(8) | tokenTotalSupply(8) | complete(1) | creator(32)
+  const virtualTokenReserves = buf.readBigUInt64LE(8);
+  const virtualSolReserves   = buf.readBigUInt64LE(16);
+  const complete             = buf[48] === 1;
+  if (complete) { console.log('   ⚠️  Bonding curve complete — token migrated, Jupiter should handle it'); return null; }
+
+  // Calculate expected tokens out: tokens = vTokenRes * lamports / (vSolRes + lamports)
+  const tokensOut  = (virtualTokenReserves * lamports) / (virtualSolReserves + lamports);
+  // Use 95% of expected tokens as amount (slippage buffer) and generous maxSolCost (+10%)
+  const amount     = tokensOut * 95n / 100n;
+  const maxSolCost = lamports * 110n / 100n;
+
+  // Get creator from bonding curve state (offset 49), derive creatorVault
+  const creator               = new PublicKey(buf.slice(49, 81));
+  const [creatorVault]        = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
+
+  // Read fee recipient from global state (offset 41)
+  let feeRecipient;
+  const globalInfo = await connection.getAccountInfo(globalPDA);
+  if (globalInfo && globalInfo.data.length >= 73) {
+    feeRecipient = new PublicKey(globalInfo.data.slice(41, 73));
+  } else {
+    console.log('   ⚠️  Could not read global state, using fallback fee recipient');
+    feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
+  }
+
+  // Determine token program (SPL vs Token-2022)
+  const mintInfo    = await connection.getAccountInfo(mint);
+  const tokenProg   = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
+
+  // Compute ATAs
+  const { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction } = await import('@solana/spl-token');
+  const associatedBondingCurve = getAssociatedTokenAddressSync(mint, bondingCurve, true, tokenProg);
+  const associatedUser         = getAssociatedTokenAddressSync(mint, keypair.publicKey, false, tokenProg);
+
+  const ixs = [];
+
+  // Create user ATA if it doesn't exist yet
+  const userAtaInfo = await connection.getAccountInfo(associatedUser);
+  if (!userAtaInfo) {
+    ixs.push(createAssociatedTokenAccountInstruction(
+      keypair.publicKey, associatedUser, keypair.publicKey, mint, tokenProg
+    ));
+  }
+
+  // Build buy instruction: discriminator(8) + amount(u64) + maxSolCost(u64)
+  const data = Buffer.alloc(24);
+  PUMP_BUY_DISCRIMINATOR.copy(data, 0);
+  data.writeBigUInt64LE(amount, 8);
+  data.writeBigUInt64LE(maxSolCost, 16);
+
+  ixs.push(new TransactionInstruction({
+    programId: PUMP_PROGRAM,
+    keys: [
+      { pubkey: globalPDA,              isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
+      { pubkey: mint,                   isSigner: false, isWritable: false },
+      { pubkey: bondingCurve,           isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,         isSigner: false, isWritable: true  },
+      { pubkey: keypair.publicKey,      isSigner: true,  isWritable: true  },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: tokenProg,              isSigner: false, isWritable: false },
+      { pubkey: creatorVault,           isSigner: false, isWritable: true  },
+      { pubkey: eventAuthority,         isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
+    ],
+    data,
+  }));
+
+  // Build and send versioned transaction
+  const { blockhash } = await connection.getLatestBlockhash('confirmed');
+  const msg = new TransactionMessage({
+    payerKey: keypair.publicKey,
+    recentBlockhash: blockhash,
+    instructions: ixs,
+  }).compileToV0Message();
+
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([keypair]);
+
+  try {
+    const sig = await connection.sendRawTransaction(vtx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    console.log(`   ✅ Pump.fun bonding curve buy sent: ${sig.slice(0, 16)}...`);
+    // Return enough for position tracking
+    return { sig, tokensOut: Number(tokensOut) / 1e6, price: solAmount / (Number(tokensOut) / 1e6) };
+  } catch (e) {
+    console.log(`   ❌ Pump.fun direct buy failed: ${e.message?.slice(0, 100)}`);
+    return null;
+  }
+}
+
 async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWallets = new Set()) {
   // Dynamic position sizing based on KOL accuracy score
   if (triggeringWallets.size > 0) {
@@ -368,8 +492,28 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
   }
   if (!quote) {
-    console.log(`   ❌ TRADE BLOCKED: Jupiter could not quote ${symbol || tokenMint.slice(0,12)} — no route (new token or low liquidity pool)`);
-    return false;
+    // Jupiter failed after retry — fall back to pump.fun bonding curve direct buy
+    console.log(`   🔄 Jupiter failed, trying pump.fun bonding curve direct...`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (!pumpResult) {
+      console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
+      return false;
+    }
+    // Record position from pump.fun buy
+    positions.set(tokenMint, {
+      entryPrice: pumpResult.price,
+      highestPrice: pumpResult.price,
+      amount: pumpResult.tokensOut,
+      solInvested: solAmount,
+      entryTime: Date.now(),
+      symbol: symbol || tokenMint.slice(0, 8),
+      txSignature: pumpResult.sig,
+    });
+    portfolio.balance -= solAmount;
+    lastBuyTime = Date.now();
+    logTrade('📗 BUY (pump.fun)', symbol || tokenMint.slice(0, 8), pumpResult.price);
+    console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
+    return true;
   }
 
   const expectedOut = parseInt(quote.outAmount);
