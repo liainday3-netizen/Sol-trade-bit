@@ -1,4 +1,4 @@
-// SOL BOT v9.6 - Sell escalating slippage (3%→50%); TX confirm fix; rug fast-stop 20%/2min; trending scanner
+// SOL BOT v9.7 - Launch filter bug fixed (was always skipping 8s-old tokens); scanner floors dropped; fast-stop 25%/4min
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -482,8 +482,8 @@ const TP_TIER2_PCT             = 100;    // 125%→100% — de-risk while lettin
 
 // ─── PROFIT HUNTER MODE ───────────────────────────────────────
 const PROFIT_HUNTER_MODE       = true;
-const PH_FAST_STOP_PCT         = 20;    // Cut position at −20% if still in first 2 min (was −15% / 5min)
-const PH_FAST_STOP_WINDOW_MS   = 2 * 60 * 1000;  // 2-min window for fast stop (was 5min)
+const PH_FAST_STOP_PCT         = 25;    // Exit at −25% if still in first 4 min (tightened from −15%/5min, relaxed from −20%/2min)
+const PH_FAST_STOP_WINDOW_MS   = 4 * 60 * 1000;  // 4-min window for fast stop
 const PH_RUN_THRESHOLD_PCT     = 60;    // Above +60% PnL → skip max-hold eviction (let it run)
 const PH_MOMENTUM_5M_MIN       = 3;     // 5%→3% — catch momentum earlier
 const PH_MOMENTUM_1H_MIN       = 7;     // 10%→7% — wider trend confirmation
@@ -1815,10 +1815,10 @@ async function scanNewTokens(connection) {
     if (isGhostLiq) {
       console.log(`      ↳ 👻 GHOST LIQ: $0 liq but ${ageHours.toFixed(1)}h old, $${Math.round(vol24h/1000)}k vol, +${chg1h.toFixed(1)}% — trying anyway`);
     }
-    if (!isGhostLiq && liq < 8000)  { console.log(`      ↳ skip: low liq`);        continue; }  // $15k→$8k
-    if (vol24h < 15000)  { console.log(`      ↳ skip: low vol`);         continue; }  // $25k→$15k
-    if (ageHours > 36)   { console.log(`      ↳ skip: too old`);         continue; }  // 24h→36h
-    if (chg1h <= 0)      { console.log(`      ↳ skip: not trending up`); continue; }
+    if (!isGhostLiq && liq < 3000)  { console.log(`      ↳ skip: low liq`);        continue; }  // $8k→$3k
+    if (vol24h < 5000)   { console.log(`      ↳ skip: low vol`);         continue; }  // $15k→$5k
+    if (ageHours > 48)   { console.log(`      ↳ skip: too old`);         continue; }  // 36h→48h
+    if (chg1h < -10)     { console.log(`      ↳ skip: dumping hard`);    continue; }  // was chg1h<=0; now allow flat/sideways
     if (!isGhostLiq && volLiqRatio < 0.25){ console.log(`      ↳ skip: low turnover`); continue; }  // 0.5→0.25
 
     const { multiplier: _sqMul, action: _sqAct, score: _sqScore } = quantifySignal([], info, 'scanner');
@@ -2013,9 +2013,9 @@ async function startPumpLaunchSubscription(connection) {
       const vol  = info?.v24hUSD || 0;
       const chg1h = info?.priceChange1hPercent || 0;
 
-      // Planetary launch filter: any volume signal in first 8s is notable
-      if (vol < 3000 && chg1h <= 0) {
-        console.log(`   ↳ LAUNCH skip: no early traction (vol=$${vol}, 1h=${chg1h.toFixed(1)}%)`);
+      // Launch filter: 8s is too young for vol or 1h data — skip only if no price at all
+      if (!info || !info.price) {
+        console.log(`   ↳ LAUNCH skip: no price data after 8s — token may not exist yet`);
         return;
       }
 
