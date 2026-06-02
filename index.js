@@ -54,7 +54,7 @@ let lastBuyTime = 0; // Cooldown tracker
 // === CONSENSUS TRACKING ===
 // Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
 const kolSignals = new Map();
-const CONSENSUS_THRESHOLD = 2;        // Require 2+ KOLs to buy same token
+const CONSENSUS_THRESHOLD = 1;        // Single KOL signal is sufficient (was 2 — caused zero trades)
 const CONSENSUS_WINDOW = 300000;      // Within 5 minutes of each other
 
 // === WALLET KEYPAIR (for live trading) ===
@@ -124,7 +124,7 @@ async function getTokenPrice(mintAddress) {
       solUsd = cgData?.solana?.usd;
     }
     if (!solUsd) {
-      const jupSol = await safeFetch(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`);
+      const jupSol = await safeFetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
       solUsd = jupSol?.data?.[SOL_MINT]?.price;
     }
     solUsd = solUsd || 85; // Last resort hardcoded fallback
@@ -679,7 +679,7 @@ async function main() {
     }
     // Fallback: Jupiter price API
     if (!solUsdPrice) {
-      const jupData = await safeFetch(`https://price.jup.ag/v6/price?ids=${SOL_MINT}`);
+      const jupData = await safeFetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
       solUsdPrice = jupData?.data?.[SOL_MINT]?.price;
     }
     if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
