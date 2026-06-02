@@ -1,4 +1,4 @@
-// SOL BOT v9.0 PLANETARY SCALE - Aggressive config + gpt-4o AI + dynamic capital scaling + pump.fun launch websocket
+// SOL BOT v9.1 - Dual-layout pump.fun buy (new creator-vault + old RENT fallback)
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -36,6 +36,7 @@ const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const TOKEN_SPL_PROGRAM  = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
 
 // === TOP KOL WALLETS TO COPY (Verified April 2026 - MadeOnSol data) ===
 // Source: https://madeonsol.com/blog/top-solana-kol-wallets-to-copy-trade
@@ -1005,9 +1006,15 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   data.writeBigUInt64LE(amount, 8);
   data.writeBigUInt64LE(maxSolCost, 16);
 
-  ixs.push(new TransactionInstruction({
+  // Build buy instruction in two layouts:
+  // - NEW layout (post creator-vault upgrade): has creatorVault, no RENT sysvar
+  // - OLD layout (pre creator-vault): has RENT sysvar, no creatorVault
+  // Some tokens on-chain match old layout; simulation catches which works.
+
+  const buildBuyIx = (useCreatorVault) => new TransactionInstruction({
     programId: PUMP_PROGRAM,
-    keys: [
+    keys: useCreatorVault ? [
+      // NEW layout — creatorVault at slot 10
       { pubkey: globalPDA,              isSigner: false, isWritable: false },
       { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
       { pubkey: mint,                   isSigner: false, isWritable: false },
@@ -1020,27 +1027,68 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
       { pubkey: creatorVault,           isSigner: false, isWritable: true  },
       { pubkey: eventAuthority,         isSigner: false, isWritable: false },
       { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
+    ] : [
+      // OLD layout — RENT sysvar at slot 10 (no creatorVault)
+      { pubkey: globalPDA,              isSigner: false, isWritable: false },
+      { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
+      { pubkey: mint,                   isSigner: false, isWritable: false },
+      { pubkey: bondingCurve,           isSigner: false, isWritable: true  },
+      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true  },
+      { pubkey: associatedUser,         isSigner: false, isWritable: true  },
+      { pubkey: keypair.publicKey,      isSigner: true,  isWritable: true  },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: tokenProg,              isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_RENT_PUBKEY,     isSigner: false, isWritable: false },
+      { pubkey: eventAuthority,         isSigner: false, isWritable: false },
+      { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
     ],
     data,
-  }));
+  });
 
-  // Build and send versioned transaction
+  const buildVtx = (buyIx, blockhash) => {
+    const allIxs = [...ixs, buyIx]; // ixs = optional ATA create ix(es)
+    const msg = new TransactionMessage({
+      payerKey: keypair.publicKey,
+      recentBlockhash: blockhash,
+      instructions: allIxs,
+    }).compileToV0Message();
+    const vtx = new VersionedTransaction(msg);
+    vtx.sign([keypair]);
+    return vtx;
+  };
+
   const { blockhash } = await connection.getLatestBlockhash('confirmed');
-  const msg = new TransactionMessage({
-    payerKey: keypair.publicKey,
-    recentBlockhash: blockhash,
-    instructions: ixs,
-  }).compileToV0Message();
 
-  const vtx = new VersionedTransaction(msg);
-  vtx.sign([keypair]);
+  // Try NEW layout first — pre-simulate silently
+  let vtx = buildVtx(buildBuyIx(true), blockhash);
+  let layoutLabel = 'new (creator-vault)';
+
+  try {
+    const sim = await connection.simulateTransaction(vtx, { replaceRecentBlockhash: true, commitment: 'confirmed' });
+    if (sim.value.err) {
+      // NEW layout failed — fall back to OLD layout
+      console.log(`   ⚠️  pump.fun new layout sim failed (${JSON.stringify(sim.value.err)}) — trying old layout (RENT sysvar)`);
+      vtx = buildVtx(buildBuyIx(false), blockhash);
+      layoutLabel = 'old (RENT sysvar)';
+
+      const sim2 = await connection.simulateTransaction(vtx, { replaceRecentBlockhash: true, commitment: 'confirmed' });
+      if (sim2.value.err) {
+        console.log(`   ❌ pump.fun old layout sim also failed: ${JSON.stringify(sim2.value.err)} — cannot route via bonding curve`);
+        return null;
+      }
+      console.log(`   ✅ pump.fun old layout sim passed — sending`);
+    }
+  } catch (simErr) {
+    console.log(`   ❌ pump.fun pre-sim threw: ${simErr.message?.slice(0, 80)} — skipping direct route`);
+    return null;
+  }
 
   try {
     const sig = await connection.sendRawTransaction(vtx.serialize(), {
-      skipPreflight: false,
+      skipPreflight: true, // already simulated above
       preflightCommitment: 'confirmed',
     });
-    console.log(`   ✅ Pump.fun bonding curve buy sent: ${sig.slice(0, 16)}...`);
+    console.log(`   ✅ Pump.fun bonding curve buy sent [${layoutLabel}]: ${sig.slice(0, 16)}...`);
     return { sig, tokensOut: Number(tokensOut) / 1e6, price: solAmount / (Number(tokensOut) / 1e6) };
   } catch (e) {
     console.log(`   ❌ Pump.fun direct buy failed: ${e.message?.slice(0, 100)}`);
