@@ -54,7 +54,74 @@ let lastBuyTime = 0; // Cooldown tracker
 // === CONSENSUS TRACKING ===
 // Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
 const kolSignals = new Map();
-const CONSENSUS_THRESHOLD = 1;        // Execute on single KOL signal (only Jijo is active)
+const CONSENSUS_THRESHOLD = 1;
+
+// === SELF-LEARNING STATE ===
+const kolScores = new Map();     // wallet -> { trades, wins, totalPnl }
+const candidateKols = new Map(); // wallet -> { hits, seenTokens }
+
+function getKolScore(wallet) {
+  const s = kolScores.get(wallet);
+  if (!s || s.trades < 3) return 0.5; // assume 50% until 3+ trades of data
+  return s.wins / s.trades; // 0.0 – 1.0
+}
+
+function getDynamicPositionSize(triggeringWallets) {
+  let total = 0, n = 0;
+  for (const w of triggeringWallets) { total += getKolScore(w); n++; }
+  const avgScore = n ? total / n : 0.5;
+  // Low-confidence KOL (score<0.4) → 0.5× size; high-confidence (>0.7) → 1.3× size
+  const multiplier = Math.max(0.5, Math.min(1.3, avgScore * 1.6));
+  const size = MAX_POSITION_SIZE_SOL * multiplier;
+  return Math.min(size, portfolio.balance * 0.2); // never >20% of balance
+}
+
+function updateKolScore(wallet, won, pnlPercent) {
+  if (!kolScores.has(wallet)) kolScores.set(wallet, { trades: 0, wins: 0, totalPnl: 0 });
+  const s = kolScores.get(wallet);
+  s.trades++;
+  if (won) s.wins++;
+  s.totalPnl += (pnlPercent || 0);
+  const wr = (s.wins / s.trades * 100).toFixed(0);
+  console.log(`📊 KOL SCORE: ${wallet.slice(0,8)}... → ${wr}% win (${s.trades} trades, +${s.totalPnl.toFixed(0)}% cumPnL)`);
+}
+
+async function discoverEarlyBuyers(connection, tokenMint, entryTime) {
+  try {
+    const mintPubkey = new PublicKey(tokenMint);
+    const sigs = await connection.getSignaturesForAddress(mintPubkey, { limit: 40 });
+    for (const sig of sigs) {
+      if (!sig.blockTime) continue;
+      const txAge = entryTime - sig.blockTime * 1000;
+      if (txAge < 0 || txAge > 300000) continue; // bought within 5min before us
+      const tx = await connection.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0 });
+      if (!tx?.meta) continue;
+      const feePayer = tx.transaction?.message?.accountKeys?.[0]?.pubkey;
+      if (!feePayer || COPY_WALLETS.includes(feePayer)) continue;
+      const pre = tx.meta.preTokenBalances || [];
+      const post = tx.meta.postTokenBalances || [];
+      for (const p of post) {
+        if (p.mint !== tokenMint) continue;
+        const preB = pre.find(x => x.mint === tokenMint && x.owner === p.owner);
+        const preAmt = preB?.uiTokenAmount?.uiAmount || 0;
+        const postAmt = p.uiTokenAmount?.uiAmount || 0;
+        if (postAmt > preAmt && p.owner === feePayer) {
+          if (!candidateKols.has(feePayer)) candidateKols.set(feePayer, { hits: 0, seenTokens: new Set() });
+          const c = candidateKols.get(feePayer);
+          if (!c.seenTokens.has(tokenMint)) {
+            c.seenTokens.add(tokenMint);
+            c.hits++;
+            console.log(`🔭 CANDIDATE KOL: ${feePayer.slice(0,8)}... spotted on ${c.hits} profitable token(s)`);
+            if (c.hits >= 3) {
+              COPY_WALLETS.push(feePayer);
+              console.log(`🌟 AUTO-PROMOTED: ${feePayer.slice(0,8)}... added to KOL tracking (${c.hits} wins)`);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) { /* discovery is best-effort */ }
+}        // Execute on single KOL signal (only Jijo is active)
 const CONSENSUS_WINDOW = 300000;      // Within 5 minutes of each other
 
 // === WALLET KEYPAIR (for live trading) ===
@@ -227,7 +294,16 @@ async function executeJupiterSwap(connection, quote) {
 }
 
 // === BUY TOKEN (Jupiter) ===
-async function buyToken(connection, tokenMint, solAmount, symbol) {
+async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWallets = new Set()) {
+  // Dynamic position sizing based on KOL accuracy score
+  if (triggeringWallets.size > 0) {
+    const dynamicSize = getDynamicPositionSize(triggeringWallets);
+    if (dynamicSize !== solAmount) {
+      const avgScore = (Array.from(triggeringWallets).reduce((a,w) => a + getKolScore(w), 0) / triggeringWallets.size * 100).toFixed(0);
+      console.log(`   🧠 DYNAMIC SIZE: ${solAmount.toFixed(4)} → ${dynamicSize.toFixed(4)} SOL (KOL avg score: ${avgScore}%)`);
+      solAmount = dynamicSize;
+    }
+  }
   console.log(`   🔍 buyToken: ${symbol || tokenMint.slice(0,12)} | ${solAmount} SOL | positions=${positions.size}/${MAX_POSITIONS} | balance=${portfolio.balance.toFixed(4)} | cooldown=${Math.max(0, Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime))/1000))}s`);
   if (positions.size >= MAX_POSITIONS) {
     console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
@@ -265,6 +341,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol) {
       solInvested: solAmount,
       entryTime: Date.now(),
       symbol: symbol || tokenMint.slice(0, 8),
+      triggeredBy: new Set(triggeringWallets),
     });
     portfolio.balance -= solAmount;
     lastBuyTime = Date.now();
@@ -328,6 +405,11 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
     const pnlSol = currentValue - position.solInvested;
     portfolio.balance += position.solInvested + pnlSol;
     portfolio.totalPnl += pnlSol;
+    // Update KOL accuracy scores
+    if (position.triggeredBy) {
+      const won = pnlPercent > 0;
+      for (const w of position.triggeredBy) updateKolScore(w, won, pnlPercent);
+    }
     positions.delete(tokenMint);
     logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
     console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
@@ -362,6 +444,15 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   portfolio.totalPnl += pnlSol;
   positions.delete(tokenMint);
 
+  // Update KOL accuracy + discover new KOLs on profitable trades
+  if (position.triggeredBy) {
+    const won = pnlPercent > 0;
+    for (const w of position.triggeredBy) updateKolScore(w, won, pnlPercent);
+    if (pnlPercent >= 30) {
+      console.log(`🔭 Scanning for early buyers of ${position.symbol} (profitable trade)...`);
+      discoverEarlyBuyers(connection, tokenMint, position.entryTime);
+    }
+  }
   logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
   console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
   return true;
@@ -482,7 +573,7 @@ async function monitorCopyWallets(connection) {
 
                       const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.2);
                       console.log(`   🚀 CONSENSUS COPY: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL (${signal.wallets.size} KOLs confirmed)`);
-                      await buyToken(connection, tokenMint, tradeSize, symbol);
+                      await buyToken(connection, tokenMint, tradeSize, symbol, signal.wallets);
                       kolSignals.delete(tokenMint); // Clear after execution
                     }
                   } else {
@@ -648,6 +739,15 @@ async function monitorPositions(connection) {
 function showStatus() {
   console.log(`\n${'═'.repeat(50)}`);
   console.log(`${PAPER_MODE ? '📝 PAPER' : '💎 LIVE'} | 💰 ${portfolio.balance.toFixed(4)} SOL | Pos: ${positions.size}/${MAX_POSITIONS} | PnL: ${portfolio.totalPnl > 0 ? '+' : ''}${portfolio.totalPnl.toFixed(4)} SOL`);
+  if (kolScores.size > 0) {
+    const sorted = [...kolScores.entries()].sort((a,b) => (b[1].wins/b[1].trades) - (a[1].wins/a[1].trades));
+    const top = sorted.slice(0, 4).map(([w,s]) => `${w.slice(0,6)}: ${(s.wins/s.trades*100).toFixed(0)}% (${s.trades}t)`).join(' | ');
+    console.log(`🧠 KOL Scores: ${top}`);
+  }
+  if (candidateKols.size > 0) {
+    const cands = [...candidateKols.entries()].filter(([,c])=>c.hits>=2).map(([w,c])=>`${w.slice(0,6)}:${c.hits}hits`).join(' ');
+    if (cands) console.log(`🔭 Candidates: ${cands}`);
+  }
   console.log(`📋 Trades: ${tradeHistory.length} | Copy: ${COPY_WALLETS.length} wallets | TXs seen: ${seenSignatures.size} | Pending signals: ${kolSignals.size}`);
   console.log(`${'═'.repeat(50)}\n`);
 }
