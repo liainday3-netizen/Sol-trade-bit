@@ -1,4 +1,4 @@
-// SOL BOT v8.3 PROFIT HUNTER - Fix pump.fun owner check + ghost-liq scanner continue on failure
+// SOL BOT v9.0 PLANETARY SCALE - Aggressive config + gpt-4o AI + dynamic capital scaling + pump.fun launch websocket
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -13,17 +13,17 @@ const OPENAI_KEY   = process.env.OPENAI_API_KEY || ''; // Optional: enables AI s
 const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
 
-// === RISK MANAGEMENT ===
-const STOP_LOSS_PERCENT = 30;         // Sell if down 30%
-const TAKE_PROFIT_PERCENT = 150;      // Sell if up 150% (2.5x)
-const TRAILING_STOP_PERCENT = 20;     // Trail 20% below peak price
-const MAX_POSITION_SIZE_SOL = 0.03;   // Max SOL per trade
-const MAX_POSITIONS = 5;              // Max concurrent positions
-const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
-const SCAN_INTERVAL = 30000;          // Scan for new tokens every 30s
-const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
-const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
-const MIN_TRADE_COOLDOWN = 60000;     // Wait 1 min between buys (tighter entry)
+// === RISK MANAGEMENT — v9.0 PLANETARY SCALE ===
+const STOP_LOSS_PERCENT = 35;         // 30→35 — more room for volatile memecoins
+const TAKE_PROFIT_PERCENT = 250;      // 150→250 — let moonshots go further
+const TRAILING_STOP_PERCENT = 15;     // 20→15 — tighter lock once we're up
+const MAX_POSITION_SIZE_SOL = 0.04;   // 0.03→0.04 (base; scales dynamically)
+const MAX_POSITIONS = 8;              // 5→8 concurrent positions
+const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
+const SCAN_INTERVAL = 15000;          // 30s→15s — 2× scan speed
+const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
+const PRIORITY_FEE_LAMPORTS = 100000; // 50k→100k — faster inclusion
+const MIN_TRADE_COOLDOWN = 30000;     // 60s→30s — catch rapid cycles
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
@@ -270,24 +270,46 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
 async function aiAnalyzeSignal(tokenInfo, source) {
   if (!OPENAI_KEY || !tokenInfo) return { boost: 0, verdict: 'no-ai' };
   try {
-    const ageH = tokenInfo.createdAt ? ((Date.now()/1000 - tokenInfo.createdAt)/3600).toFixed(1) : '?';
+    const ageH   = tokenInfo.createdAt ? ((Date.now()/1000 - tokenInfo.createdAt)/3600).toFixed(1) : '?';
+    const liq    = (tokenInfo.liquidity || 0).toLocaleString();
+    const vol    = (tokenInfo.v24hUSD   || 0).toLocaleString();
+    const mcap   = (tokenInfo.marketCap || 0).toLocaleString();
+    const chg5m  = tokenInfo.priceChange5mPercent?.toFixed(2)  || '?';
+    const chg1h  = tokenInfo.priceChange1hPercent?.toFixed(2)  || '?';
+    const chg24h = tokenInfo.priceChange24hPercent?.toFixed(2) || '?';
+    const vlR    = tokenInfo.liquidity ? (tokenInfo.v24hUSD/tokenInfo.liquidity).toFixed(2) : '?';
+    const recentTrades = tradeHistory.slice(-10);
+    const wins   = recentTrades.filter(t => t.pnlPercent > 0).length;
+    const winR   = recentTrades.length ? Math.round(wins/recentTrades.length*100) : '?';
+    const streak = profitHunterState.consecutiveWins;
+
     const prompt = [
-      `You are a Solana memecoin trading AI. Evaluate this token signal and return a JSON object only.`,
-      `Token: ${tokenInfo.symbol || 'unknown'}`,
-      `Source: ${source}`,
-      `Age: ${ageH}h | Liquidity: $${(tokenInfo.liquidity||0).toLocaleString()} | Vol24h: $${(tokenInfo.v24hUSD||0).toLocaleString()}`,
-      `Price change 1h: ${tokenInfo.priceChange1hPercent?.toFixed(2) || '?'}% | 24h: ${tokenInfo.priceChange24hPercent?.toFixed(2) || '?'}%`,
-      `V/L ratio: ${tokenInfo.liquidity ? (tokenInfo.v24hUSD/tokenInfo.liquidity).toFixed(2) : '?'}`,
-      `Respond with JSON only: { "boost": <integer 0-25>, "verdict": "<BUY|SKIP|HOLD>", "reason": "<one short sentence>" }`,
-      `boost=0 means neutral. boost>15 means strong AI conviction. Penalise: age>12h, liq<10k, falling price. Reward: fresh+trending+high-VL.`,
+      `You are a world-class Solana memecoin alpha hunter. Mission: find the next 10x in the next 30 minutes. You operate at planetary scale — precision and boldness both matter.`,
+      ``,
+      `TOKEN SIGNAL (source: ${source})`,
+      `  Symbol : ${tokenInfo.symbol || 'unknown'}`,
+      `  Age    : ${ageH}h | Liq: $${liq} | Vol24h: $${vol} | MCap: $${mcap}`,
+      `  V/L    : ${vlR} | 5m: ${chg5m}% | 1h: ${chg1h}% | 24h: ${chg24h}%`,
+      ``,
+      `PORTFOLIO CONTEXT`,
+      `  Balance: ${portfolio.balance.toFixed(3)} SOL | Win rate (last 10): ${winR}% | Win streak: ${streak}`,
+      ``,
+      `RULES`,
+      `  boost +15 to +35: strong early alpha (fresh, pumping, thin float, high momentum)`,
+      `  boost +1 to +14: positive lean but not conviction`,
+      `  boost 0: neutral`,
+      `  boost -1 to -10: red flags (age>12h, declining, low vol, likely rug)`,
+      `  BUY = deploy capital now. SKIP = hard pass. HOLD = marginal, pass for now.`,
+      ``,
+      `Return JSON only (no markdown): { "boost": <integer -10 to 35>, "verdict": "<BUY|SKIP|HOLD>", "reason": "<6 words max>" }`,
     ].join('\n');
+
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], max_tokens: 80, temperature: 0.2 }),
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }], max_tokens: 100, temperature: 0.1 }),
     });
     const data = await res.json();
-    // Detect OpenAI API errors (wrong key, quota, etc.)
     if (!res.ok || data.error) {
       const errMsg = data.error?.message || data.error || `HTTP ${res.status}`;
       console.log(`   ❌ OpenAI API error: ${errMsg}`);
@@ -303,8 +325,8 @@ async function aiAnalyzeSignal(tokenInfo, source) {
       console.log(`   ⚠️  AI parse failed, raw: ${text.slice(0, 80)}`);
       return { boost: 0, verdict: 'parse-error' };
     }
-    const boost = Math.max(0, Math.min(25, parsed.boost || 0));
-    console.log(`   🤖 AI VERDICT: ${parsed.verdict} | boost+${boost} | ${parsed.reason}`);
+    const boost = Math.max(-10, Math.min(35, parsed.boost || 0));  // −10→+35 range
+    console.log(`   🤖 AI VERDICT: ${parsed.verdict} | boost${boost >= 0 ? '+' : ''}${boost} | ${parsed.reason}`);
     return { boost, verdict: parsed.verdict, reason: parsed.reason };
   } catch (e) {
     console.log(`   ⚠️  AI analysis skipped: ${e.message}`);
@@ -347,7 +369,7 @@ const candidateKols = new Map(); // wallet -> { hits, seenTokens }
 // === SAFETY CAPITAL SCALE ENGINE ===
 // ══════════════════════════════════════════════════════════════
 // Position size = balance × BASE_RISK_PCT, capped at hard limits
-const BASE_RISK_PCT    = 0.12;   // 12% of balance per trade (aggressive)
+const BASE_RISK_PCT    = 0.15;   // 12%→15% of balance per trade
 const MIN_POSITION_SOL = 0.008;  // Never trade less than this
 const MAX_POSITION_SOL = 0.08;   // Hard cap regardless of balance
 const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
@@ -356,7 +378,7 @@ const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
 
 // --- CAPITAL PROTECTION ---
 const ABSOLUTE_FLOOR_SOL       = 0.04;   // Never trade if balance drops below this
-const MAX_DAILY_TRADES         = 20;     // Hard cap on buys per day
+const MAX_DAILY_TRADES         = 35;     // 20→35 hard cap on buys per day
 const MAX_CONSECUTIVE_LOSSES   = 3;      // Pause 1h after N straight losses
 const MAX_CONSECUTIVE_LOSSES_HARD = 5;  // Pause 4h after N straight losses
 const STREAK_PAUSE_MS          = 1 * 60 * 60 * 1000;  // 1h streak pause
@@ -367,22 +389,22 @@ const SOFT_LOSS_TIER2          = 0.11;   // At 11% daily loss → 40% position s
 
 // --- FULL SCALING ---
 const KELLY_LOOKBACK_TRADES    = 25;     // Trades to use for Kelly Criterion
-const KELLY_FRACTION           = 0.40;   // Fractional Kelly (40%) for safety
+const KELLY_FRACTION           = 0.50;   // 40%→50% fractional Kelly (more aggressive)
 const STREAK_SCALE_PCT         = 0.15;   // ±15% per win/loss streak tier
 const VOL_HIGH_THRESHOLD       = 50;     // >50% 1h change → reduce size 25%
 const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
 // Tiered take-profit (partial sells)
-const TP_TIER1_PCT             = 75;     // Take 40% off at  +75%
-const TP_TIER2_PCT             = 125;    // Take 40% off at +125% (last 20% runs)
+const TP_TIER1_PCT             = 50;     // 75%→50% — take chips faster
+const TP_TIER2_PCT             = 100;    // 125%→100% — de-risk while letting tail run
 
 // ─── PROFIT HUNTER MODE ───────────────────────────────────────
 const PROFIT_HUNTER_MODE       = true;
 const PH_FAST_STOP_PCT         = 15;    // Cut position at −15% if still in first 5 min
 const PH_FAST_STOP_WINDOW_MS   = 5 * 60 * 1000;  // 5-min window for fast stop
 const PH_RUN_THRESHOLD_PCT     = 60;    // Above +60% PnL → skip max-hold eviction (let it run)
-const PH_MOMENTUM_5M_MIN       = 5;     // ≥5% 5m change → "hot" token
-const PH_MOMENTUM_1H_MIN       = 10;    // ≥10% 1h change → confirmed trend
-const PH_MOMENTUM_SIZE_BOOST   = 1.40;  // 1.4× size on confirmed momentum signals
+const PH_MOMENTUM_5M_MIN       = 3;     // 5%→3% — catch momentum earlier
+const PH_MOMENTUM_1H_MIN       = 7;     // 10%→7% — wider trend confirmation
+const PH_MOMENTUM_SIZE_BOOST   = 1.60;  // 1.4%→1.6× size on confirmed momentum
 const PH_STREAK_THRESHOLD      = 3;     // 3+ consecutive wins → streak bonus
 const PH_STREAK_CAP_BOOST      = 1.25;  // +25% position cap during streak
 
@@ -1046,8 +1068,9 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     console.log(`   ♻️  PH RE-ENTRY: buying back ${symbol || tokenMint.slice(0,8)} (previously profitable)`);
   }
 
-  if (positions.size >= MAX_POSITIONS) {
-    console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
+  const _dynLimits = getScaledLimits();
+  if (positions.size >= _dynLimits.maxConc) {
+    console.log(`⚠️  Max positions (${_dynLimits.maxConc} ${_dynLimits.label}) reached, skipping buy`);
     return false;
   }
   if (solAmount < 0.005) {
@@ -1055,8 +1078,9 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     return false;
   }
   // Cooldown: don't buy again within 2 minutes of last buy
-  if (Date.now() - lastBuyTime < MIN_TRADE_COOLDOWN) {
-    console.log(`⚠️  Cooldown active (${Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime)) / 1000)}s left), skipping`);
+  const _cooldown = getScaledLimits().cooldown;
+  if (Date.now() - lastBuyTime < _cooldown) {
+    console.log(`⚠️  Cooldown active (${Math.round((_cooldown - (Date.now() - lastBuyTime)) / 1000)}s left), skipping`);
     return false;
   }
   // Reserve: keep minimum SOL for gas
@@ -1543,18 +1567,17 @@ async function scanNewTokens(connection) {
 
     console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
-    // FILTERS — fresh momentum only:
+    // FILTERS — v9.0 PLANETARY: floors dropped, age window widened
     // Ghost-liquidity bypass: pump.fun tokens <2h old often show $0 liq on DexScreener
-    // while still trading actively — allow them if volume + momentum are strong enough.
-    const isGhostLiq = liq === 0 && ageHours < 2.0 && vol24h >= 50000 && chg1h >= 15;
+    const isGhostLiq = liq === 0 && ageHours < 2.0 && vol24h >= 30000 && chg1h >= 10;
     if (isGhostLiq) {
       console.log(`      ↳ 👻 GHOST LIQ: $0 liq but ${ageHours.toFixed(1)}h old, $${Math.round(vol24h/1000)}k vol, +${chg1h.toFixed(1)}% — trying anyway`);
     }
-    if (!isGhostLiq && liq < 15000) { console.log(`      ↳ skip: low liq`);        continue; }
-    if (vol24h < 25000)   { console.log(`      ↳ skip: low vol`);         continue; }
-    if (ageHours > 24)    { console.log(`      ↳ skip: too old`);         continue; }
-    if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
-    if (!isGhostLiq && volLiqRatio < 0.5){ console.log(`      ↳ skip: low turnover`); continue; }
+    if (!isGhostLiq && liq < 8000)  { console.log(`      ↳ skip: low liq`);        continue; }  // $15k→$8k
+    if (vol24h < 15000)  { console.log(`      ↳ skip: low vol`);         continue; }  // $25k→$15k
+    if (ageHours > 36)   { console.log(`      ↳ skip: too old`);         continue; }  // 24h→36h
+    if (chg1h <= 0)      { console.log(`      ↳ skip: not trending up`); continue; }
+    if (!isGhostLiq && volLiqRatio < 0.25){ console.log(`      ↳ skip: low turnover`); continue; }  // 0.5→0.25
 
     const { multiplier: _sqMul, action: _sqAct, score: _sqScore } = quantifySignal([], info, 'scanner');
     const { boost: _sqAiBoost, verdict: _sqAiVerdict } = await aiAnalyzeSignal(info, 'scanner');
@@ -1687,6 +1710,111 @@ function showStatus() {
 }
 
 // === MAIN ===
+// ══════════════════════════════════════════════════════════════
+// PLANETARY SCALE — Dynamic capital scaling
+// As balance grows, all limits auto-expand. Built to handle 0.2 SOL today
+// and 1,000 SOL tomorrow without a single config change.
+// ══════════════════════════════════════════════════════════════
+function getScaledLimits() {
+  const bal = portfolio.balance;
+  // Each tier unlocks larger positions, more concurrent slots, faster cycling
+  if (bal >= 100.0) return { maxPosSol: bal * 0.030, maxConc: 25, cooldown: 10000, label: '🌍 TITAN' };
+  if (bal >= 50.0)  return { maxPosSol: bal * 0.035, maxConc: 20, cooldown: 12000, label: '🌏 MACRO' };
+  if (bal >= 20.0)  return { maxPosSol: bal * 0.040, maxConc: 16, cooldown: 15000, label: '🌐 SCALE' };
+  if (bal >= 10.0)  return { maxPosSol: bal * 0.045, maxConc: 14, cooldown: 18000, label: '🔥 SURGE' };
+  if (bal >= 5.0)   return { maxPosSol: bal * 0.050, maxConc: 12, cooldown: 22000, label: '⚡ STORM' };
+  if (bal >= 2.0)   return { maxPosSol: bal * 0.055, maxConc: 10, cooldown: 26000, label: '🚀 BOOST' };
+  if (bal >= 1.0)   return { maxPosSol: bal * 0.060, maxConc:  9, cooldown: 28000, label: '💫 GROW'  };
+  if (bal >= 0.5)   return { maxPosSol: bal * 0.070, maxConc:  8, cooldown: 30000, label: '🌱 SEED'  };
+  // Base case: current config
+  return { maxPosSol: MAX_POSITION_SIZE_SOL, maxConc: MAX_POSITIONS, cooldown: MIN_TRADE_COOLDOWN, label: '⚙️ BASE' };
+}
+
+// ══════════════════════════════════════════════════════════════
+// PLANETARY SCALE — Real-time pump.fun launch detector
+// Subscribes to pump.fun program logs via Solana websocket.
+// Catches new token creation events in <1s — before DexScreener indexes them.
+// Standard scanner sees them at earliest on the next 15s tick; this fires instantly.
+// ══════════════════════════════════════════════════════════════
+const _recentLaunchSigs = new Set(); // dedup recent create TXs
+
+async function startPumpLaunchSubscription(connection) {
+  console.log('🌍 PLANETARY: Subscribing to pump.fun real-time launch feed...');
+  connection.onLogs(PUMP_PROGRAM, async ({ signature, err, logs }) => {
+    if (err) return;
+    // Only process Create instructions (new token launches)
+    if (!logs.some(l => l.includes('Instruction: Create'))) return;
+    if (_recentLaunchSigs.has(signature)) return;
+    _recentLaunchSigs.add(signature);
+    if (_recentLaunchSigs.size > 1000) {
+      const oldest = _recentLaunchSigs.values().next().value;
+      _recentLaunchSigs.delete(oldest);
+    }
+
+    try {
+      // Parse the transaction to extract the new token mint
+      const tx = await connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0, commitment: 'confirmed'
+      });
+      if (!tx) return;
+
+      // New mint is in the post-token-balances (first entry after Create)
+      const mintAddr = tx.meta?.postTokenBalances?.[0]?.mint;
+      if (!mintAddr) return;
+
+      // Skip if we already hold or recently traded this token
+      if (positions.has(mintAddr)) return;
+
+      console.log(`\n🚀🌍 PUMP LAUNCH DETECTED: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
+
+      // Wait 8s — let a few early trades establish minimal price data
+      await new Promise(r => setTimeout(r, 8000));
+
+      // Fetch token info — might be empty at first
+      const info = await getTokenInfo(mintAddr);
+      const vol  = info?.v24hUSD || 0;
+      const chg1h = info?.priceChange1hPercent || 0;
+
+      // Planetary launch filter: any volume signal in first 8s is notable
+      if (vol < 3000 && chg1h <= 0) {
+        console.log(`   ↳ LAUNCH skip: no early traction (vol=$${vol}, 1h=${chg1h.toFixed(1)}%)`);
+        return;
+      }
+
+      // Quant + AI evaluation
+      const { multiplier: _lMul, action: _lAct, score: _lScore } = quantifySignal([], info || { symbol: mintAddr.slice(0,8) }, 'launch');
+      const { boost: _lBoost, verdict: _lVerdict } = await aiAnalyzeSignal(info || { symbol: mintAddr.slice(0,8), v24hUSD: vol, priceChange1hPercent: chg1h }, 'launch');
+      const _lFinal = (_lScore || 0) + _lBoost;
+
+      // Launch signals get a gentler score gate (AI conviction can carry it)
+      if (_lAct === 'SKIP' && _lVerdict !== 'BUY' && _lFinal < 15) {
+        console.log(`   ⏭️  LAUNCH QUANT+AI skip (score=${_lFinal})`);
+        return;
+      }
+
+      const scaleLimits = getScaledLimits();
+      if (positions.size >= scaleLimits.maxConc) {
+        console.log(`   ⚠️  LAUNCH: max positions reached — skipping ${mintAddr.slice(0,8)}`);
+        return;
+      }
+
+      const sym = info?.symbol || mintAddr.slice(0,8);
+      // Launch size: 60% of normal max (unproven, reduce risk)
+      const launchSize = Math.min(scaleLimits.maxPosSol * 0.60, portfolio.balance * 0.12);
+      console.log(`   🚀🌍 PLANETARY LAUNCH BUY: ${sym} | size=${launchSize.toFixed(4)} SOL | score=${_lFinal} | AI=${_lVerdict}`);
+
+      // Try pump.fun bonding curve first (definitely pre-graduation)
+      const launched = await buyPumpFunDirect(connection, mintAddr, launchSize);
+      if (!launched) await buyToken(connection, mintAddr, launchSize, sym);
+
+    } catch (launchErr) {
+      console.log(`   ⚠️  Launch handler error: ${launchErr.message?.slice(0,80)}`);
+    }
+  }, 'confirmed');
+
+  console.log('✅ Pump.fun launch subscription active — catching tokens at birth');
+}
+
 async function main() {
   const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`);
 
@@ -1700,8 +1828,14 @@ async function main() {
 
   await loadMemory();
 
+  // Start real-time pump.fun launch detector (planetary scale feature)
+  startPumpLaunchSubscription(connection).catch(e =>
+    console.log(`⚠️  Launch subscription failed to start: ${e.message}`)
+  );
+
   console.log('\n' + '═'.repeat(50));
-  console.log('🚀 SOL BOT v5.2 - Copy Trading + Quant Memory Engine');
+  const _scale = getScaledLimits();
+  console.log(`🌍 SOL BOT v9.0 PLANETARY SCALE — ${_scale.label} | maxPos: ${_scale.maxPosSol.toFixed(4)} SOL | concurrent: ${_scale.maxConc}`);
   console.log('═'.repeat(50));
   console.log(`${PAPER_MODE ? '📝 PAPER MODE' : '💎 LIVE MODE — REAL MONEY'}`);
   console.log(`💰 Balance: ${portfolio.balance.toFixed(4)} SOL`);
