@@ -43,11 +43,7 @@ const COPY_WALLETS = [
   // #10 Goyim — +456 SOL (30d) | 363 trades | Low-freq, high-conviction
   'G3gZWqrYkNmYFKYCyfRCNtGuxdyuE2wiYKkZpiZn4WSS',
 
-  // PumpBuyer_A — on-chain verified buying pump.fun tokens, active right now
-  '8rwoMSv4ndpd3Wdh9YEjET1eKNha9u92Xvztuibsn4GW',
 
-  // PumpBuyer_B — on-chain verified buying pump.fun tokens, active right now
-  '62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV',
 ];
 
 // === STATE ===
@@ -532,7 +528,7 @@ async function monitorCopyWallets(connection) {
             // Note: KOL may use a trading terminal — fee payer can differ, but they must still SIGN
             const accountKeys = txDetail?.transaction?.message?.accountKeys || [];
             const kolIsSigner = accountKeys.some(
-              k => k.pubkey === walletAddr && k.signer === true
+              k => k.pubkey.toString() === walletAddr && k.signer === true
             );
             if (!kolIsSigner) {
               console.log(`   ⏭️  Skipping TX — KOL did not sign (likely spam/ATA creation)`);
