@@ -1,4 +1,4 @@
-// SOL BOT v8.1 PROFIT HUNTER - Bug fixes: AI error logging + Jupiter escalating slippage (3%→5%→10%)
+// SOL BOT v8.2 PROFIT HUNTER - Ghost-liquidity bypass: catch pump.fun rockets before DexScreener indexes them
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -1530,17 +1530,36 @@ async function scanNewTokens(connection) {
     console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
     // FILTERS — fresh momentum only:
-    if (liq < 15000)      { console.log(`      ↳ skip: low liq`);        continue; }
+    // Ghost-liquidity bypass: pump.fun tokens <2h old often show $0 liq on DexScreener
+    // while still trading actively — allow them if volume + momentum are strong enough.
+    const isGhostLiq = liq === 0 && ageHours < 2.0 && vol24h >= 50000 && chg1h >= 15;
+    if (isGhostLiq) {
+      console.log(`      ↳ 👻 GHOST LIQ: $0 liq but ${ageHours.toFixed(1)}h old, $${Math.round(vol24h/1000)}k vol, +${chg1h.toFixed(1)}% — trying anyway`);
+    }
+    if (!isGhostLiq && liq < 15000) { console.log(`      ↳ skip: low liq`);        continue; }
     if (vol24h < 25000)   { console.log(`      ↳ skip: low vol`);         continue; }
     if (ageHours > 24)    { console.log(`      ↳ skip: too old`);         continue; }
     if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
-    if (volLiqRatio < 0.5){ console.log(`      ↳ skip: low turnover`);    continue; }
+    if (!isGhostLiq && volLiqRatio < 0.5){ console.log(`      ↳ skip: low turnover`); continue; }
 
     const { multiplier: _sqMul, action: _sqAct, score: _sqScore } = quantifySignal([], info, 'scanner');
     const { boost: _sqAiBoost, verdict: _sqAiVerdict } = await aiAnalyzeSignal(info, 'scanner');
     const _sqFinalScore = (_sqScore || 0) + _sqAiBoost;
     if (_sqAct === 'SKIP' && _sqAiVerdict !== 'BUY') { console.log(`   ⏭️  QUANT+AI: scanner signal skipped (score=${_sqFinalScore})`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters! (score=${_sqFinalScore} | AI=${_sqAiVerdict})`);
+
+    // Ghost-liquidity tokens: reduced size, pump.fun direct only
+    if (isGhostLiq) {
+      const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.50, portfolio.balance * 0.10);
+      console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → trying pump.fun direct`);
+      const ghostBought = await buyPumpFunDirect(connection, addr, ghostSize);
+      if (ghostBought) break;
+      // If pump.fun fails, let Jupiter try below
+      console.log(`   👻 pump.fun direct failed for ${symbol} — trying Jupiter anyway`);
+      await buyToken(connection, addr, ghostSize, symbol);
+      break;
+    }
+
     // Profit Hunter: momentum boost for hot tokens
     let _sqSizeMul = _sqAiBoost >= 15 ? 1.2 : 1.0;
     if (PROFIT_HUNTER_MODE) {
