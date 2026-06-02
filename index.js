@@ -226,11 +226,33 @@ async function getTokenPrice(mintAddress) {
 }
 
 async function getTokenInfo(mintAddress) {
+  // Use DexScreener (no API key needed, same data fields)
   const data = await safeFetch(
-    `https://public-api.birdeye.so/defi/token_overview?address=${mintAddress}`,
-    { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+    `https://api.dexscreener.com/tokens/v1/solana/${mintAddress}`
   );
-  return data?.data || null;
+  const pairs = Array.isArray(data) ? data : data?.pairs || [];
+  if (!pairs.length) return null;
+
+  // Pick the pair with the most liquidity (usually the main pool)
+  const best = pairs.sort((a, b) =>
+    (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+  )[0];
+
+  const createdAt = best.pairCreatedAt ? Math.floor(best.pairCreatedAt / 1000) : null;
+
+  return {
+    address:              mintAddress,
+    symbol:               best.baseToken?.symbol || mintAddress.slice(0, 8),
+    price:                parseFloat(best.priceUsd || 0),
+    liquidity:            best.liquidity?.usd || 0,
+    v24hUSD:              best.volume?.h24 || 0,
+    priceChange24hPercent: best.priceChange?.h24 || 0,
+    priceChange1hPercent:  best.priceChange?.h1 || 0,
+    createdAt,
+    marketCap:            best.marketCap || 0,
+    fdv:                  best.fdv || 0,
+    dexId:                best.dexId || '',
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -813,78 +835,57 @@ async function monitorCopyWallets(connection) {
 
 // === NEW TOKEN SCANNER (Independent Trading) ===
 async function scanNewTokens(connection) {
-  // Try Birdeye trending first
-  let candidates = [];
-  const trending = await safeFetch(
-    'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=10',
-    { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
-  );
-
-  if (trending?.data?.tokens) {
-    candidates = trending.data.tokens.filter(t => {
-      if (positions.has(t.address)) return false;
-      if (!t.liquidity || t.liquidity < 50000) return false;
-      if (!t.price || t.price <= 0) return false;
-      return true;
+  // Use DexScreener — no API key needed
+  // Source 1: top boosted tokens (community-promoted, usually new)
+  let rawTokens = [];
+  const boosted = await safeFetch('https://api.dexscreener.com/token-boosts/top/v1');
+  if (Array.isArray(boosted)) {
+    rawTokens = boosted.filter(t => t.chainId === 'solana').map(t => t.tokenAddress);
+  }
+  // Source 2: latest token profiles (even newer launches)
+  const profiles = await safeFetch('https://api.dexscreener.com/token-profiles/latest/v1');
+  if (Array.isArray(profiles)) {
+    profiles.filter(t => t.chainId === 'solana').forEach(t => {
+      if (!rawTokens.includes(t.tokenAddress)) rawTokens.push(t.tokenAddress);
     });
   }
 
-  // Fallback: DexScreener boosted tokens (no API key needed)
-  if (candidates.length === 0) {
-    const dexTrending = await safeFetch('https://api.dexscreener.com/token-boosts/latest/v1');
-    if (dexTrending && Array.isArray(dexTrending)) {
-      const solTokens = dexTrending.filter(t => t.chainId === 'solana').slice(0, 10);
-      for (const t of solTokens) {
-        if (positions.has(t.tokenAddress)) continue;
-        const info = await getTokenInfo(t.tokenAddress);
-        if (info && info.liquidity >= 50000 && info.price > 0) {
-          candidates.push({ address: t.tokenAddress, price: info.price, liquidity: info.liquidity, symbol: info.symbol });
-        }
-      }
-    }
-  }
+  rawTokens = rawTokens.filter(addr => !positions.has(addr)).slice(0, 15);
+  if (rawTokens.length === 0) return;
 
-  if (candidates.length === 0) return;
+  console.log(`🔍 Scanning ${rawTokens.length} DexScreener candidates...`);
 
-  console.log(`🔍 Found ${candidates.length} trending candidates (>$50K liq)`);
+  // Score each token using DexScreener pair data (getTokenInfo now uses DexScreener)
+  for (const addr of rawTokens) {
+    if (positions.size >= MAX_POSITIONS) break;
 
-  // Score candidates by momentum signals
-  for (const token of candidates.slice(0, 5)) {
-    const symbol = token.symbol || token.address.slice(0, 8);
-    const liq = token.liquidity || 0;
+    const info = await getTokenInfo(addr);
+    if (!info || !info.price || info.price <= 0) continue;
 
-    // Get detailed token info for age + volume
-    const info = await getTokenInfo(token.address);
-    if (!info) continue;
+    const liq       = info.liquidity || 0;
+    const vol24h    = info.v24hUSD   || 0;
+    const chg24h    = info.priceChange24hPercent || 0;
+    const chg1h     = info.priceChange1hPercent  || 0;
+    const ageHours  = info.createdAt
+      ? (Date.now() / 1000 - info.createdAt) / 3600
+      : 999;
+    const volLiqRatio = liq > 0 ? vol24h / liq : 0;
+    const symbol    = info.symbol || addr.slice(0, 8);
 
-    const createdAt = info.createdAt ? new Date(info.createdAt * 1000) : null;
-    const ageHours = createdAt ? (Date.now() - createdAt.getTime()) / 3600000 : 999;
-    const volume24h = info.v24hUSD || 0;
-    const priceChange = info.priceChange24hPercent || 0;
+    console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
-    // FILTERS for independent entry:
-    // 1. Listed < 6 hours (fresh momentum, not stale)
-    // 2. Volume > $100K in 24h (active trading)
-    // 3. Price change positive (uptrend, not dumping)
-    // 4. Volume/Liquidity ratio > 2 (healthy turnover)
-    const volLiqRatio = liq > 0 ? volume24h / liq : 0;
+    // FILTERS — fresh momentum only:
+    if (liq < 30000)      { console.log(`      ↳ skip: low liq`);        continue; }
+    if (vol24h < 50000)   { console.log(`      ↳ skip: low vol`);         continue; }
+    if (ageHours > 8)     { console.log(`      ↳ skip: too old`);         continue; }
+    if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
+    if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
-    console.log(`   └─ ${symbol} | ${token.price.toFixed(6)} | Liq: ${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: ${volume24h.toLocaleString()} | Chg: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
-
-    if (ageHours > 6) continue;           // Too old
-    if (volume24h < 100000) continue;      // Not enough volume
-    if (priceChange <= 0) continue;        // Not trending up
-    if (volLiqRatio < 2) continue;         // Low turnover
-
-    // PASSED ALL FILTERS — this is a high-quality independent signal
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters!`);
-
-    if (positions.size < MAX_POSITIONS) {
-      const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.15); // Slightly smaller for independent trades
-      console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
-      const bought = await buyToken(connection, token.address, tradeSize, symbol);
-      if (bought) break; // Only one independent trade per scan cycle
-    }
+    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL, portfolio.balance * 0.15);
+    console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
+    const bought = await buyToken(connection, addr, tradeSize, symbol);
+    if (bought) break; // One independent trade per scan cycle
   }
 }
 
