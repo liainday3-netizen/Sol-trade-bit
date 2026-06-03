@@ -810,7 +810,7 @@ const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
   'api.jup.ag':            700,
-  'quote-api.jup.ag':      900,
+  'quote-api.jup.ag':      300,
   'quote-api2.jup.ag':     500,
   'mainnet.helius-rpc.com':300,
 };
@@ -849,15 +849,14 @@ async function safeFetch(url, options = {}, _retries = 4) {
   }
 }
 
-async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
+async function safeFetchVerbose(url, options = {}, label = '', _retries = 6) {
   await _domainThrottle(url);
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const data = await res.json().catch(() => null);
     if (res.status === 429 && _retries > 0) {
-      const ra = parseInt(res.headers.get('Retry-After') || '4', 10);
-      const delay = Math.min(ra * 1000 * Math.pow(2, 3 - _retries), 20000);
-      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${(delay/1000).toFixed(1)}s (${_retries} left)`);
+      const delay = 600;
+      console.log(`   ⏳ 429 [${new URL(url).hostname}] — retry in ${delay}ms (${_retries} left)`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetchVerbose(url, options, label, _retries - 1);
     }
@@ -871,7 +870,7 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
     const cause = e.cause?.code || e.cause?.message || e.code || '';
     const detail = cause ? ` [${cause}]` : '';
     if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'ENOTFOUND')) {
-      const delay = 1500 * (4 - _retries);
+      const delay = 400 * (7 - _retries);
       console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetchVerbose(url, options, label, _retries - 1);
@@ -998,8 +997,14 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBp
     asLegacyTransaction: 'false',
   });
 
-  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`)
-    ?? await safeFetchVerbose(`${JUPITER_QUOTE_URL_ALT}?${params}`, {}, `Jupiter quote alt (${slippage/100}%slip)`);
+  // Race primary and alt — first success wins
+  const [primary, alt] = await Promise.allSettled([
+    safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`),
+    safeFetchVerbose(`${JUPITER_QUOTE_URL_ALT}?${params}`, {}, `Jupiter quote alt (${slippage/100}%slip)`),
+  ]);
+  const quote = (primary.status === 'fulfilled' && primary.value)
+    || (alt.status === 'fulfilled' && alt.value)
+    || null;
   if (!quote) return null;
   // Jupiter returns HTTP 200 but with error field when no route exists
   if (quote.error || !quote.outAmount) {
@@ -1009,21 +1014,21 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBp
   return quote;
 }
 
-// Tries Jupiter with escalating slippage before giving up
+// Tries Jupiter with escalating slippage — no waits, go wide fast
 async function getJupiterQuoteWithFallback(inputMint, outputMint, amountLamports) {
-  // Tier 1: 3% (default — tight, fast)
   let q = await getJupiterQuote(inputMint, outputMint, amountLamports, 300);
   if (q) return q;
-  await new Promise(r => setTimeout(r, 2000));
-  // Tier 2: 5% — new tokens with thin books
-  console.log('   🔄 Retrying Jupiter at 5% slippage...');
+  console.log('   🔄 5% slip...');
   q = await getJupiterQuote(inputMint, outputMint, amountLamports, 500);
   if (q) return q;
-  await new Promise(r => setTimeout(r, 3000));
-  // Tier 3: 10% — very new/illiquid (memecoins post-launch)
-  console.log('   🔄 Retrying Jupiter at 10% slippage...');
+  console.log('   🔄 10% slip...');
   q = await getJupiterQuote(inputMint, outputMint, amountLamports, 1000);
-  return q;
+  if (q) return q;
+  console.log('   🔄 25% slip...');
+  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 2500);
+  if (q) return q;
+  console.log('   🔄 50% slip — last resort...');
+  return getJupiterQuote(inputMint, outputMint, amountLamports, 5000);
 }
 
 async function executeJupiterSwap(connection, quote) {
