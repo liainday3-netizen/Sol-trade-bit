@@ -28,8 +28,8 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL  = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL   = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_URL  = 'https://public.jupiterapi.com/v6/quote';
+const JUPITER_SWAP_URL   = 'https://public.jupiterapi.com/v6/swap';
 const JUPITER_TIMEOUT_MS = 5000;
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
@@ -808,7 +808,7 @@ const _domainTails = {};
 const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
-  'quote-api.jup.ag':      500,
+  'public.jupiterapi.com': 500,
   'quote-api2.jup.ag':     500,
   'mainnet.helius-rpc.com':300,
 };
@@ -936,7 +936,7 @@ async function getTokenPrice(mintAddress) {
     }
     solUsd = solUsd || 85; // Last resort hardcoded fallback
     const quote = await safeFetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
+      `https://public.jupiterapi.com/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
     );
     if (quote?.outAmount) {
       const tokensPerSol = parseInt(quote.outAmount) / (10 ** (quote.outputDecimals || 9));
