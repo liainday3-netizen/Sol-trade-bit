@@ -1,4 +1,4 @@
-// SOL BOT v9.8 - Quantum entanglement quant model (geometric coherence, multiplicative factors, 2× size on full alignment)
+// SOL BOT v9.9 - Jupiter bug fix: BC tokens never routed to Jupiter; blockhash pre-fetch; swap URL fallback; cache invalidation
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -31,6 +31,7 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JUPITER_QUOTE_URL      = 'https://quote-api.jup.ag/v6/quote';
 const JUPITER_QUOTE_URL_ALT  = 'https://api.jup.ag/swap/v1/quote';  // fallback endpoint
 const JUPITER_SWAP_URL       = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_SWAP_URL_ALT   = 'https://api.jup.ag/swap/v1/swap';   // fallback swap endpoint
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -955,47 +956,60 @@ async function executeJupiterSwap(connection, quote) {
     return null;
   }
 
-  // Get swap transaction from Jupiter
-  const swapResponse = await safeFetch(JUPITER_SWAP_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: keypair.publicKey.toString(),
-      wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
-      dynamicComputeUnitLimit: true,
-    }),
-  });
+  // ── Fetch blockhash BEFORE building TX (must match for confirmation) ──
+  let confBlockhash, confLvbh;
+  try {
+    ({ blockhash: confBlockhash, lastValidBlockHeight: confLvbh } =
+      await connection.getLatestBlockhash('confirmed'));
+  } catch (e) {
+    console.log(`   ❌ Failed to fetch blockhash: ${e.message}`);
+    return null;
+  }
 
+  // ── Build swap TX — try primary endpoint then fallback ───────────────
+  const swapBody = JSON.stringify({
+    quoteResponse: quote,
+    userPublicKey: keypair.publicKey.toString(),
+    wrapAndUnwrapSol: true,
+    computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
+    dynamicComputeUnitLimit: true,
+  });
+  const swapOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: swapBody };
+
+  let swapResponse = await safeFetch(JUPITER_SWAP_URL, swapOpts);
   if (!swapResponse?.swapTransaction) {
-    console.log('   ❌ Jupiter swap transaction build failed');
+    console.log('   🔄 Primary swap endpoint failed — trying fallback...');
+    swapResponse = await safeFetch(JUPITER_SWAP_URL_ALT, swapOpts);
+  }
+  if (!swapResponse?.swapTransaction) {
+    console.log('   ❌ Jupiter swap TX build failed (both endpoints)');
     return null;
   }
 
   try {
-    // Deserialize, sign, and send
+    // ── Deserialize, sign, and send ──────────────────────────────────────
     const txBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(txBuf);
     transaction.sign([keypair]);
 
     const signature = await connection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: true,
+      skipPreflight: true,   // speed-optimised; on-chain errors caught in confirmation
       maxRetries: 3,
     });
     console.log(`   📡 TX sent: https://solscan.io/tx/${signature}`);
 
-    // Confirm using blockhash-aware form — prevents "expired blockhash" false failures
+    // ── Confirm using pre-fetched blockhash (no race with expiry) ────────
     try {
-      const { blockhash: bh, lastValidBlockHeight: lvbh } = await connection.getLatestBlockhash('confirmed');
-      const confirmation = await connection.confirmTransaction({ signature, blockhash: bh, lastValidBlockHeight: lvbh }, 'confirmed');
+      const confirmation = await connection.confirmTransaction(
+        { signature, blockhash: confBlockhash, lastValidBlockHeight: confLvbh },
+        'confirmed'
+      );
       if (confirmation.value.err) {
         console.log(`   ❌ TX failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
         return null;
       }
     } catch (confirmErr) {
-      // Timeout / network error — don't mark as failed; verify via status check instead
-      console.log(`   ⚠️  Confirmation timed out (${confirmErr.message?.slice(0,60)}) — verifying TX...`);
+      console.log(`   ⚠️  Confirmation timeout (${confirmErr.message?.slice(0,60)}) — verifying...`);
       await new Promise(r => setTimeout(r, 6000));
       try {
         const status = await connection.getSignatureStatus(signature);
@@ -1003,9 +1017,8 @@ async function executeJupiterSwap(connection, quote) {
           console.log(`   ❌ TX status: failed — ${JSON.stringify(status.value.err)}`);
           return null;
         }
-        const cs = status?.value?.confirmationStatus;
-        console.log(`   ✅ TX status: ${cs || 'pending'} — treating as success`);
-      } catch { /* best-effort verify — assume success */ }
+        console.log(`   ✅ TX status: ${status?.value?.confirmationStatus || 'pending'}`);
+      } catch { /* best-effort — assume success */ }
     }
 
     console.log(`   ✅ TX confirmed: https://solscan.io/tx/${signature}`);
@@ -1027,56 +1040,92 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
   const label = symbol || tokenMint.slice(0, 12);
   const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
 
-  // ─── Step 1: Bonding curve detection (cached — no duplicate RPC) ──
+  // ─── Step 1: Bonding curve detection (cached) ───────────────────────
   const { hasBondingCurve, bcComplete, bcInfo } = await getBondingCurveInfo(connection, tokenMint);
-  console.log(`   🗺️  ROUTE ENGINE | ${label} | bonding_curve=${hasBondingCurve} complete=${bcComplete}`);
+  const bcStatus = hasBondingCurve ? (bcComplete ? 'graduated→DEX' : 'ACTIVE BC') : 'no BC (DEX)';
+  console.log(`   🗺️  ROUTE ENGINE | ${label} | ${solAmount.toFixed(4)} SOL | BC: ${bcStatus}`);
 
-  // ─── Route A: pump.fun direct (active bonding curve only) ──
+  // ══════════════════════════════════════════════════
+  // PUMP.FUN PATH — token still on bonding curve (pre-graduation)
+  // Jupiter has NO liquidity for BC tokens — never try it here.
+  // ══════════════════════════════════════════════════
   if (hasBondingCurve && !bcComplete) {
-    console.log(`   🎯 ROUTE A: pump.fun bonding curve direct`);
-    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount, bcInfo /* cached — no re-fetch */);
+    // Route A: pump.fun direct with cached layout
+    console.log(`   🎯 ROUTE A: pump.fun direct (active bonding curve)`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount, bcInfo);
     if (pumpResult) {
       routeStats.pumpFunDirect.ok++;
       console.log(`   ✅ ROUTE A success`);
       return pumpResult;
     }
     routeStats.pumpFunDirect.fail++;
-    console.log(`   ⚠️  ROUTE A failed — falling through to Jupiter`);
+    console.log(`   ⚠️  ROUTE A failed — clearing BC cache, retrying with fresh detection`);
+
+    // Invalidate stale cache and retry with fresh BC detection
+    bcCache.delete(tokenMint);
+    await new Promise(r => setTimeout(r, 2000));
+    const { hasBondingCurve: hbc2, bcComplete: bc2, bcInfo: bi2 } = await getBondingCurveInfo(connection, tokenMint);
+
+    if (hbc2 && !bc2) {
+      console.log(`   🎯 ROUTE A2: pump.fun retry (fresh BC data)`);
+      const retry = await buyPumpFunDirect(connection, tokenMint, solAmount, bi2);
+      if (retry) {
+        routeStats.pumpFunDirect.ok++;
+        console.log(`   ✅ ROUTE A2 success`);
+        return retry;
+      }
+      routeStats.pumpFunDirect.fail++;
+      console.log(`   ❌ All pump.fun routes exhausted for ${label}`);
+    } else if (bc2) {
+      console.log(`   🎓 Token just graduated! Routing to Jupiter...`);
+      // fall through to Jupiter path below
+    } else {
+      // Bonding curve gone — token may not exist or already rugged
+      console.log(`   ❌ BC vanished — token may not exist yet or already rugged`);
+      routeStats.exhausted++;
+      return null;
+    }
+    // If we fell through (bc2 === graduated), proceed to Jupiter
+    if (hbc2 && !bc2) {
+      routeStats.exhausted++;
+      return null;
+    }
   }
 
-  // ─── Route B: Jupiter with slippage escalation ─────────────
-  // For bonding-curve tokens (just launched) go wide immediately — no point trying 3%
-  // For graduated tokens ramp from tight to wide
-  const slippageRamp = hasBondingCurve
-    ? [500, 1000, 5000]          // new token: 5% → 10% → 50%
-    : [300, 500, 1000, 5000];    // graduated: 3% → 5% → 10% → 50%
+  // ══════════════════════════════════════════════════
+  // JUPITER PATH — graduated or DEX-listed tokens only
+  // Wider slippage for newly graduated tokens (thin books).
+  // ══════════════════════════════════════════════════
+  const justGraduated = hasBondingCurve && bcComplete;
+  const slippageRamp = justGraduated
+    ? [1000, 3000, 5000]           // just graduated: 10% → 30% → 50% (thin books)
+    : [300, 500, 1000, 3000, 5000]; // established: 3% → 5% → 10% → 30% → 50%
 
-  console.log(`   🎯 ROUTE B: Jupiter (slippage ramp ${slippageRamp.map(b=>b/100+'%').join('→')})`);
+  console.log(`   🎯 ROUTE B: Jupiter (${slippageRamp.map(b => b/100 + '%').join('→')})`);
 
   for (let i = 0; i < slippageRamp.length; i++) {
     const slipBps = slippageRamp[i];
     if (i > 0) {
       await new Promise(r => setTimeout(r, 1500));
-      console.log(`   🔄 Jupiter retry at ${slipBps / 100}% slippage...`);
+      console.log(`   🔄 Jupiter retry at ${slipBps / 100}%...`);
     }
     const q = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports, slipBps);
     if (!q) continue;
     const sig = await executeJupiterSwap(connection, q);
     if (sig) {
       routeStats.jupiterSwap.ok++;
-      const decimals = q.outputDecimals || 6;
-      const tokensOut = parseInt(q.outAmount) / (10 ** decimals);
+      const tokensOut = parseInt(q.outAmount) / 1e6; // 6 decimals (standard SPL meme)
       const price = tokensOut > 0 ? solAmount / tokensOut : 0;
       console.log(`   ✅ ROUTE B success (${slipBps / 100}% slippage)`);
       return { sig, tokensOut, price };
     }
   }
   routeStats.jupiterSwap.fail++;
-  console.log(`   ⚠️  ROUTE B failed — all Jupiter slippage tiers exhausted`);
+  console.log(`   ⚠️  ROUTE B failed — all Jupiter tiers exhausted`);
 
-  // ─── Route C: Last-resort pump.fun (no BC detected but worth trying) ─
+  // Route C: last-resort pump.fun (no BC detected — DexScreener might have missed it)
   if (!hasBondingCurve) {
-    console.log(`   🎯 ROUTE C: last-resort pump.fun (DexScreener may have missed it)`);
+    console.log(`   🎯 ROUTE C: last-resort pump.fun (DexScreener may have missed BC)`);
     const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
     if (pumpResult) {
       routeStats.pumpFunDirect.ok++;
@@ -1090,7 +1139,7 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
   routeStats.exhausted++;
   const total = routeStats.pumpFunDirect.ok + routeStats.pumpFunDirect.fail +
                 routeStats.jupiterSwap.ok   + routeStats.jupiterSwap.fail;
-  if (total % 5 === 0) logRouteStats(); // periodic telemetry
+  if (total % 5 === 0) logRouteStats();
   console.log(`   ❌ ROUTE ENGINE: all routes exhausted for ${label}`);
   return null;
 }
