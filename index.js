@@ -1,9 +1,10 @@
-// SOL BOT v10.3 - RATE LIMIT FIX: domain throttle + exp backoff + SOL price cache + 22s scan interval
+// SOL BOT v10.4 - FULL UPGRADE: sell timeout, rug gate, backup RPC, public.jupiterapi.com, priority fee boost
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // === CONFIG ===
-const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
+const HELIUS_KEY  = process.env.HELIUS_API_KEY || '';
+const BACKUP_RPC  = process.env.BACKUP_RPC_URL  || 'https://api.mainnet-beta.solana.com';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
@@ -22,7 +23,7 @@ const MAX_POSITIONS = 12;             // flexed: 8→12 concurrent positions
 const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
 const SCAN_INTERVAL = 22000;          // raised 15s→22s to cut API 429 pressure
 const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
-const PRIORITY_FEE_LAMPORTS = 100000; // 50k→100k — faster inclusion
+const PRIORITY_FEE_LAMPORTS = 200000; // boosted 200k — better TX inclusion on congested launches
 const MIN_TRADE_COOLDOWN = 12000;     // flexed: 30s→12s — faster cycling
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
@@ -934,7 +935,7 @@ async function getTokenPrice(mintAddress) {
       const kcSol = await safeFetch('https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=SOL-USDT');
       solUsd = kcSol?.data?.price ? parseFloat(kcSol.data.price) : null;
     }
-    solUsd = solUsd || 85; // Last resort hardcoded fallback
+    solUsd = solUsd || 165; // Last resort hardcoded fallback (update monthly)
     const quote = await safeFetch(
       `https://public.jupiterapi.com/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
     );
@@ -1103,6 +1104,18 @@ async function executeJupiterSwap(connection, quote) {
 // Priority: pump.fun direct (if active BC) → Jupiter (wide slippage) → last-resort pump.fun
 // Telemetry: routeStats tracks success/failure per route
 // ══════════════════════════════════════════════════════════════
+
+// === RUG DETECTION GATE ===
+function isLikelyRug(tokenInfo) {
+  if (!tokenInfo) return false;
+  const liq  = tokenInfo.liquidity?.usd  || tokenInfo.liquidityUsd  || 0;
+  const mcap = tokenInfo.marketCap        || tokenInfo.fdv           || 0;
+  const vol5m = tokenInfo.volume?.m5      || tokenInfo.volume5m      || 0;
+  const vol1h = tokenInfo.volume?.h1      || tokenInfo.volume1h      || 0;
+  if (mcap > 500 && liq === 0)                    return true; // pool drained / rug
+  if (mcap > 0 && mcap < 50 && vol5m === 0 && vol1h === 0) return true; // dead launch
+  return false;
+}
 
 async function routeEngine(connection, tokenMint, solAmount, symbol) {
   const label = symbol || tokenMint.slice(0, 12);
@@ -1457,6 +1470,15 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Safety gates: daily loss limit, drawdown circuit-breaker
   if (!checkSafetyGates()) return false;
 
+  // Rug gate: quick check before burning gas on obvious rugs
+  {
+    const _ri = await getTokenInfo(tokenMint).catch(() => null);
+    if (isLikelyRug(_ri)) {
+      console.log(`   🚫 RUG GATE: ${symbol || tokenMint.slice(0,10)} — zero liquidity or dead launch, skipping`);
+      return false;
+    }
+  }
+
   // Profit Hunter re-entry: allow re-buying a previously profitable token
   if (PROFIT_HUNTER_MODE && profitHunterState.reEntryAllowed.has(tokenMint)) {
     profitHunterState.reEntryAllowed.delete(tokenMint);
@@ -1601,19 +1623,22 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   // Escalating slippage on sell — memecoin liquidity is thin; 3% alone fails constantly
   console.log(`🔄 Getting sell quote: ${position.symbol} → SOL (${reason})`);
   const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
-  let quote = null;
-  for (let si = 0; si < sellSlippageRamp.length; si++) {
-    if (si > 0) {
-      await new Promise(r => setTimeout(r, 1500));
-      console.log(`   🔄 Sell retry at ${sellSlippageRamp[si]/100}% slippage...`);
-    }
-    quote = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw, sellSlippageRamp[si]);
-    if (quote) break;
-  }
-  if (!quote) {
-    console.log(`   ❌ Quote failed for sell after all slippage tiers — will retry next cycle`);
+  const _sellQ = await Promise.race([
+    (async () => {
+      for (let si = 0; si < sellSlippageRamp.length; si++) {
+        if (si > 0) console.log(`   🔄 Sell → ${sellSlippageRamp[si]/100}% slip...`);
+        const q = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw, sellSlippageRamp[si]);
+        if (q) return q;
+      }
+      return null;
+    })(),
+    new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS + 1000)),
+  ]);
+  if (!_sellQ) {
+    console.log(`   ❌ Sell: timeout or no route — retry next cycle`);
     return false;
   }
+  const quote = _sellQ;
 
   const expectedSolBack = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
   console.log(`   📊 Quote: ${expectedSolBack.toFixed(4)} SOL back`);
@@ -1734,19 +1759,22 @@ async function partialSellToken(connection, tokenMint, ratio, reason, knownPrice
     const tokenDecimals = 6;
     const rawAmount = Math.floor(tokenAmountToSell * (10 ** tokenDecimals));
     const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
-    let quote = null;
-    for (let si = 0; si < sellSlippageRamp.length; si++) {
-      if (si > 0) {
-        await new Promise(r => setTimeout(r, 1500));
-        console.log(`   🔄 Partial sell retry at ${sellSlippageRamp[si]/100}% slippage...`);
-      }
-      quote = await getJupiterQuote(tokenMint, SOL_MINT, rawAmount, sellSlippageRamp[si]);
-      if (quote) break;
-    }
-    if (!quote) {
-      console.log(`   ⚠️  Partial sell: no Jupiter route at any slippage — keeping position`);
+    const _pSellQ = await Promise.race([
+      (async () => {
+        for (let si = 0; si < sellSlippageRamp.length; si++) {
+          if (si > 0) console.log(`   🔄 Partial sell → ${sellSlippageRamp[si]/100}% slip...`);
+          const q = await getJupiterQuote(tokenMint, SOL_MINT, rawAmount, sellSlippageRamp[si]);
+          if (q) return q;
+        }
+        return null;
+      })(),
+      new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS + 1000)),
+    ]);
+    if (!_pSellQ) {
+      console.log(`   ⚠️  Partial sell: timeout or no route — keeping position`);
       return false;
     }
+    const quote = _pSellQ;
     const signature = await executeJupiterSwap(connection, quote);
     if (!signature) return false;
 
@@ -2265,7 +2293,22 @@ async function startPumpLaunchSubscription(connection) {
 }
 
 async function main() {
-  const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`);
+  // Build primary RPC URL; fall back to public endpoint if Helius key is missing
+  const _primaryRpc = HELIUS_KEY
+    ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
+    : BACKUP_RPC;
+  const connection = new Connection(_primaryRpc, { commitment: 'confirmed' });
+  // Quick connectivity probe — failover to backup if primary unreachable
+  try {
+    await Promise.race([
+      connection.getVersion(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
+    ]);
+    console.log(`🔗 RPC: ${_primaryRpc.split('?')[0]}`);
+  } catch (_rpcErr) {
+    console.log(`⚠️  Primary RPC unreachable (${_rpcErr.message}) → switching to ${BACKUP_RPC}`);
+    Object.assign(connection, new Connection(BACKUP_RPC, { commitment: 'confirmed' }));
+  }
 
   // Get wallet balance
   const pubkey = new PublicKey(WALLET);
