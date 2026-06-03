@@ -28,10 +28,10 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL      = 'https://api.jup.ag/swap/v1/quote';           // primary (stable on Railway)
-const JUPITER_QUOTE_URL_ALT  = 'https://quote-api.jup.ag/v6/quote';          // fallback
-const JUPITER_SWAP_URL       = 'https://api.jup.ag/swap/v1/swap';            // primary (stable on Railway)
-const JUPITER_SWAP_URL_ALT   = 'https://quote-api.jup.ag/v6/swap';           // fallback
+const JUPITER_QUOTE_URL      = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_QUOTE_URL_ALT  = 'https://api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_URL       = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_SWAP_URL_ALT   = 'https://api.jup.ag/swap/v1/swap';
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -810,7 +810,7 @@ const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
   'api.jup.ag':            700,
-  'quote-api.jup.ag':      500,
+  'quote-api.jup.ag':      900,
   'quote-api2.jup.ag':     500,
   'mainnet.helius-rpc.com':300,
 };
@@ -854,6 +854,13 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const data = await res.json().catch(() => null);
+    if (res.status === 429 && _retries > 0) {
+      const ra = parseInt(res.headers.get('Retry-After') || '4', 10);
+      const delay = Math.min(ra * 1000 * Math.pow(2, 3 - _retries), 20000);
+      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${(delay/1000).toFixed(1)}s (${_retries} left)`);
+      await new Promise(r => setTimeout(r, delay));
+      return safeFetchVerbose(url, options, label, _retries - 1);
+    }
     if (!res.ok) {
       const errMsg = data?.error?.message || data?.error || data?.message || res.statusText;
       console.log(`   ❌ ${label || url.slice(0,60)} → HTTP ${res.status}: ${errMsg}`);
@@ -863,7 +870,7 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
   } catch (e) {
     const cause = e.cause?.code || e.cause?.message || e.code || '';
     const detail = cause ? ` [${cause}]` : '';
-    if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT')) {
+    if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'ENOTFOUND')) {
       const delay = 1500 * (4 - _retries);
       console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
       await new Promise(r => setTimeout(r, delay));
