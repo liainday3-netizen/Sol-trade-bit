@@ -1,4 +1,4 @@
-// SOL BOT v10.0 - FLEX MODE: BASE_RISK 28%, MAX_POS 0.07, 12s cooldown, 12 concurrent, MICRO tier, quant 2.8×/1.7×/0.9×, thresholds 55%/35%/18%
+// SOL BOT v10.1 - SNIPE ENGINE: launch snipe 200ms bypass-quant + graduation snipe 25% slippage + full flex mode
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -38,6 +38,21 @@ const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const TOKEN_SPL_PROGRAM  = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+
+// ═══════════════════════════════════════════════════════════════
+// === SNIPE MODE ===
+// ═══════════════════════════════════════════════════════════════
+const SNIPE_MODE              = true;   // buy on every new launch — no quant gate
+const SNIPE_SIZE_SOL          = 0.05;   // flat SOL per snipe entry
+const SNIPE_MAX_CONCURRENT    = 3;      // max live snipe positions at once
+const SNIPE_LAUNCH_DELAY_MS   = 200;    // ms after detection before buying (TX propagation)
+const SNIPE_BYPASS_QUANT      = true;   // skip quant scoring — speed > signal quality for snipes
+const SNIPE_GRAD_ENABLED      = true;   // snipe graduation events (BC complete → Raydium)
+const SNIPE_GRAD_SLIPPAGE_BPS = 2500;   // 25% slippage for graduation buys (thin Raydium books)
+const SNIPE_GRAD_SIZE_SOL     = 0.06;   // slightly bigger on graduation (more predictable entry)
+const SNIPE_GRAD_DELAY_MS     = 2500;   // wait 2.5s for Raydium pool init after graduation
+const snipeStats  = { launches: 0, grads: 0, ok: 0, fail: 0 };
+const _snipeActive = new Set(); // mints currently in snipe flight (dedup)
 const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
 
 // === TOP KOL WALLETS TO COPY (Verified April 2026 - MadeOnSol data) ===
@@ -371,7 +386,7 @@ const routeStats = {
 function logRouteStats() {
   const pf = routeStats.pumpFunDirect;
   const jp = routeStats.jupiterSwap;
-  console.log(`   📊 ROUTE STATS | pump.fun: ${pf.ok}✅ ${pf.fail}❌ | Jupiter: ${jp.ok}✅ ${jp.fail}❌ | exhausted: ${routeStats.exhausted}`);
+  console.log(`   📊 ROUTE STATS | pump.fun: ${pf.ok}✅ ${pf.fail}❌ | Jupiter: ${jp.ok}✅ ${jp.fail}❌ | exhausted: ${routeStats.exhausted} | snipes: ${snipeStats.ok}✅/${snipeStats.launches}L ${snipeStats.grads}G`);
 }
 
 // === BONDING CURVE CACHE ===
@@ -2029,87 +2044,152 @@ function getScaledLimits() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// PLANETARY SCALE — Real-time pump.fun launch detector
-// Subscribes to pump.fun program logs via Solana websocket.
-// Catches new token creation events in <1s — before DexScreener indexes them.
-// Standard scanner sees them at earliest on the next 15s tick; this fires instantly.
 // ══════════════════════════════════════════════════════════════
-const _recentLaunchSigs = new Set(); // dedup recent create TXs
+// SNIPE ENGINE — Real-time pump.fun launch + graduation sniping
+// LAUNCH:     fires on Instruction:Create  (<200ms after detection)
+// GRADUATION: fires on Instruction:Withdraw (bonding curve complete → Raydium)
+// Both skip quant/AI when SNIPE_BYPASS_QUANT=true — raw speed over signal quality.
+// ══════════════════════════════════════════════════════════════
+const _recentLaunchSigs = new Set(); // dedup processed TXs
+
+// Helper: fast mint extraction from parsed TX
+function extractMintFromTx(tx) {
+  // Primary: postTokenBalances (most reliable when available)
+  const fromBalances = tx.meta?.postTokenBalances?.[0]?.mint;
+  if (fromBalances) return fromBalances;
+  // Fallback: first writable non-signer in account keys (the newly created mint)
+  const keys = tx.transaction?.message?.accountKeys || [];
+  for (const k of keys) {
+    const pk = k.pubkey?.toString?.() || k.toString?.();
+    if (pk && pk.length === 44 && !pk.startsWith('11111111') && !pk.startsWith('Token') && !pk.startsWith('Sysvar')) {
+      return pk;
+    }
+  }
+  return null;
+}
 
 async function startPumpLaunchSubscription(connection) {
-  console.log('🌍 PLANETARY: Subscribing to pump.fun real-time launch feed...');
+  console.log('⚡ SNIPE ENGINE: Subscribing to pump.fun launch + graduation feeds...');
+
   connection.onLogs(PUMP_PROGRAM, async ({ signature, err, logs }) => {
     if (err) return;
-    // Only process Create instructions (new token launches)
-    if (!logs.some(l => l.includes('Instruction: Create'))) return;
     if (_recentLaunchSigs.has(signature)) return;
     _recentLaunchSigs.add(signature);
-    if (_recentLaunchSigs.size > 1000) {
-      const oldest = _recentLaunchSigs.values().next().value;
-      _recentLaunchSigs.delete(oldest);
-    }
+    if (_recentLaunchSigs.size > 2000) _recentLaunchSigs.delete(_recentLaunchSigs.values().next().value);
+
+    const isLaunch = logs.some(l => l.includes('Instruction: Create'));
+    const isGrad   = SNIPE_GRAD_ENABLED && logs.some(l =>
+      l.includes('Instruction: Withdraw') || l.includes('Instruction: SetComplete') || l.includes('complete: true')
+    );
+    if (!isLaunch && !isGrad) return;
 
     try {
-      // Parse the transaction to extract the new token mint
+      // Fetch TX to extract mint address
       const tx = await connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0, commitment: 'confirmed'
+        maxSupportedTransactionVersion: 0, commitment: 'confirmed',
       });
       if (!tx) return;
 
-      // New mint is in the post-token-balances (first entry after Create)
-      const mintAddr = tx.meta?.postTokenBalances?.[0]?.mint;
+      const mintAddr = extractMintFromTx(tx);
       if (!mintAddr) return;
-
-      // Skip if we already hold or recently traded this token
       if (positions.has(mintAddr)) return;
+      if (_snipeActive.has(mintAddr)) return;
 
-      console.log(`\n🚀🌍 PUMP LAUNCH DETECTED: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
+      // ── GRADUATION SNIPE ────────────────────────────────────────────────
+      if (isGrad && !isLaunch) {
+        snipeStats.grads++;
+        console.log(`\n🎓⚡ GRAD SNIPE: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
+        // Clear stale BC cache — token is now graduated
+        bcCache.delete(mintAddr);
 
-      // Wait 8s — let a few early trades establish minimal price data
-      await new Promise(r => setTimeout(r, 8000));
+        _snipeActive.add(mintAddr);
+        try {
+          // Wait briefly for Raydium pool initialisation
+          await new Promise(r => setTimeout(r, SNIPE_GRAD_DELAY_MS));
 
-      // Fetch token info — might be empty at first
-      const info = await getTokenInfo(mintAddr);
-      const vol  = info?.v24hUSD || 0;
-      const chg1h = info?.priceChange1hPercent || 0;
+          if (positions.size >= SNIPE_MAX_CONCURRENT) {
+            console.log(`   ⚠️  GRAD SNIPE: ${SNIPE_MAX_CONCURRENT} snipes active — deferring`);
+            return;
+          }
+          if (portfolio.balance < SNIPE_GRAD_SIZE_SOL + ABSOLUTE_FLOOR_SOL) {
+            console.log(`   ⚠️  GRAD SNIPE: insufficient balance`);
+            return;
+          }
 
-      // Launch filter: 8s is too young for vol or 1h data — skip only if no price at all
-      if (!info || !info.price) {
-        console.log(`   ↳ LAUNCH skip: no price data after 8s — token may not exist yet`);
+          console.log(`   🎓⚡ GRAD BUY: ${mintAddr.slice(0,12)}... | ${SNIPE_GRAD_SIZE_SOL} SOL | slippage=${SNIPE_GRAD_SLIPPAGE_BPS/100}%`);
+          const q = await getJupiterQuote(SOL_MINT, mintAddr,
+            Math.floor(SNIPE_GRAD_SIZE_SOL * 1e9), SNIPE_GRAD_SLIPPAGE_BPS);
+          if (q) {
+            const sig = await executeJupiterSwap(connection, q);
+            if (sig) {
+              snipeStats.ok++;
+              const tokensOut = parseInt(q.outAmount) / 1e6;
+              positions.set(mintAddr, {
+                mint: mintAddr, symbol: mintAddr.slice(0,8), entryPrice: SNIPE_GRAD_SIZE_SOL / tokensOut,
+                entryTime: Date.now(), solSpent: SNIPE_GRAD_SIZE_SOL, tokensHeld: tokensOut,
+                highWaterMark: SNIPE_GRAD_SIZE_SOL / tokensOut, isSnipe: true, isGrad: true,
+              });
+              console.log(`   ✅ GRAD SNIPE success: ${sig.slice(0,16)}...`);
+            } else { snipeStats.fail++; }
+          } else {
+            snipeStats.fail++;
+            console.log(`   ❌ GRAD SNIPE: no Jupiter quote yet`);
+          }
+        } finally { _snipeActive.delete(mintAddr); }
         return;
       }
 
-      // Quant + AI evaluation
-      const { multiplier: _lMul, action: _lAct, score: _lScore } = quantifySignal([], info || { symbol: mintAddr.slice(0,8) }, 'launch');
-      const { boost: _lBoost, verdict: _lVerdict } = await aiAnalyzeSignal(info || { symbol: mintAddr.slice(0,8), v24hUSD: vol, priceChange1hPercent: chg1h }, 'launch');
-      const _lFinal = (_lScore || 0) + _lBoost;
+      // ── LAUNCH SNIPE ─────────────────────────────────────────────────────
+      snipeStats.launches++;
+      console.log(`\n⚡ LAUNCH SNIPE: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
 
-      // Launch signals get a gentler score gate (AI conviction can carry it)
-      if (_lAct === 'SKIP' && _lVerdict !== 'BUY' && _lFinal < 15) {
-        console.log(`   ⏭️  LAUNCH QUANT+AI skip (score=${_lFinal})`);
+      // Snipe concurrency guard
+      if (_snipeActive.size >= SNIPE_MAX_CONCURRENT) {
+        console.log(`   ⚠️  LAUNCH SNIPE: ${SNIPE_MAX_CONCURRENT} snipes in flight — skipping`);
+        return;
+      }
+      if (portfolio.balance < SNIPE_SIZE_SOL + ABSOLUTE_FLOOR_SOL) {
+        console.log(`   ⚠️  LAUNCH SNIPE: insufficient balance`);
         return;
       }
 
-      const scaleLimits = getScaledLimits();
-      if (positions.size >= scaleLimits.maxConc) {
-        console.log(`   ⚠️  LAUNCH: max positions reached — skipping ${mintAddr.slice(0,8)}`);
-        return;
-      }
+      _snipeActive.add(mintAddr);
+      try {
+        // Minimal delay for TX propagation
+        if (SNIPE_LAUNCH_DELAY_MS > 0) await new Promise(r => setTimeout(r, SNIPE_LAUNCH_DELAY_MS));
 
-      const sym = info?.symbol || mintAddr.slice(0,8);
-      // Launch size: 60% of normal max (unproven, reduce risk)
-      const launchSize = Math.min(scaleLimits.maxPosSol * 0.90, portfolio.balance * 0.25); // flexed
-      console.log(`   🚀🌍 PLANETARY LAUNCH BUY: ${sym} | size=${launchSize.toFixed(4)} SOL | score=${_lFinal} | AI=${_lVerdict}`);
+        if (SNIPE_BYPASS_QUANT) {
+          // Pure speed: route engine directly (BC detection → pump.fun direct)
+          console.log(`   ⚡ SNIPE BUY (bypass quant): ${SNIPE_SIZE_SOL} SOL → pump.fun direct`);
+          const result = await routeEngine(connection, mintAddr, SNIPE_SIZE_SOL, mintAddr.slice(0,8));
+          if (result) {
+            snipeStats.ok++;
+            console.log(`   ✅ LAUNCH SNIPE success | stats: ${snipeStats.ok}✅ ${snipeStats.fail}❌ of ${snipeStats.launches} launches`);
+          } else {
+            snipeStats.fail++;
+            console.log(`   ❌ LAUNCH SNIPE failed | stats: ${snipeStats.ok}✅ ${snipeStats.fail}❌`);
+          }
+        } else {
+          // Quant-gated path (SNIPE_BYPASS_QUANT=false) — same as old launch logic
+          await new Promise(r => setTimeout(r, 8000 - SNIPE_LAUNCH_DELAY_MS));
+          const info = await getTokenInfo(mintAddr);
+          if (!info?.price) { console.log(`   ↳ skip: no price after delay`); return; }
+          const { multiplier: _lMul, action: _lAct, score: _lScore } = quantifySignal([], info, 'launch');
+          const { boost: _lBoost, verdict: _lVerdict } = await aiAnalyzeSignal(info, 'launch');
+          if (_lAct === 'SKIP' && _lVerdict !== 'BUY' && (_lScore + _lBoost) < 15) return;
+          const scaleLimits = getScaledLimits();
+          const launchSize = Math.min(scaleLimits.maxPosSol * 0.90, portfolio.balance * 0.25);
+          await routeEngine(connection, mintAddr, launchSize, info.symbol || mintAddr.slice(0,8));
+        }
+      } finally { _snipeActive.delete(mintAddr); }
 
-      // Route engine: detects active bonding curve → pump.fun direct first, Jupiter fallback
-      const launched = await routeEngine(connection, mintAddr, launchSize, sym);
-
-    } catch (launchErr) {
-      console.log(`   ⚠️  Launch handler error: ${launchErr.message?.slice(0,80)}`);
+    } catch (snipeErr) {
+      console.log(`   ⚠️  Snipe handler error: ${snipeErr.message?.slice(0,80)}`);
+      _snipeActive.delete(mintAddr);
     }
   }, 'confirmed');
 
-  console.log('✅ Pump.fun launch subscription active — catching tokens at birth');
+  console.log(`✅ SNIPE ENGINE active | launch_delay=${SNIPE_LAUNCH_DELAY_MS}ms | grad_snipe=${SNIPE_GRAD_ENABLED} | bypass_quant=${SNIPE_BYPASS_QUANT} | size=${SNIPE_SIZE_SOL}/${SNIPE_GRAD_SIZE_SOL} SOL`);
 }
 
 async function main() {
