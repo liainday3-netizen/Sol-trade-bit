@@ -1,4 +1,4 @@
-// SOL BOT v10.4 - FULL UPGRADE: sell timeout, rug gate, backup RPC, public.jupiterapi.com, priority fee boost
+// SOL BOT v10.5 - slow it down: single snipe, 1s launch delay, quote-api.jup.ag DNS fix, ENOTFOUND fast-fail
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -19,7 +19,7 @@ const STOP_LOSS_PERCENT = 35;         // 30→35 — more room for volatile meme
 const TAKE_PROFIT_PERCENT = 250;      // 150→250 — let moonshots go further
 const TRAILING_STOP_PERCENT = 15;     // 20→15 — tighter lock once we're up
 const MAX_POSITION_SIZE_SOL = 0.07;   // flexed: 0.04→0.07 base hard cap
-const MAX_POSITIONS = 12;             // flexed: 8→12 concurrent positions
+const MAX_POSITIONS = 5;              // conservative: max 5 held positions
 const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
 const SCAN_INTERVAL = 22000;          // raised 15s→22s to cut API 429 pressure
 const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
@@ -29,9 +29,9 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL  = 'https://public.jupiterapi.com/v6/quote';
-const JUPITER_SWAP_URL   = 'https://public.jupiterapi.com/v6/swap';
-const JUPITER_TIMEOUT_MS = 5000;
+const JUPITER_QUOTE_URL  = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_URL   = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_TIMEOUT_MS = 8000;
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -44,8 +44,8 @@ const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 // ═══════════════════════════════════════════════════════════════
 const SNIPE_MODE              = true;   // buy on every new launch — no quant gate
 const SNIPE_SIZE_SOL          = 0.05;   // flat SOL per snipe entry
-const SNIPE_MAX_CONCURRENT    = 3;      // max live snipe positions at once
-const SNIPE_LAUNCH_DELAY_MS   = 200;    // ms after detection before buying (TX propagation)
+const SNIPE_MAX_CONCURRENT    = 1;      // slow: one snipe at a time
+const SNIPE_LAUNCH_DELAY_MS   = 1000;   // slow: wait 1s after detection (lets BC propagate)
 const SNIPE_BYPASS_QUANT      = true;   // skip quant scoring — speed > signal quality for snipes
 const SNIPE_GRAD_ENABLED      = true;   // snipe graduation events (BC complete → Raydium)
 const SNIPE_GRAD_SLIPPAGE_BPS = 2500;   // 25% slippage for graduation buys (thin Raydium books)
@@ -809,8 +809,7 @@ const _domainTails = {};
 const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
-  'public.jupiterapi.com': 500,
-  'quote-api2.jup.ag':     500,
+  'quote-api.jup.ag':      900,   // higher gap = fewer 429s under reduced concurrency
   'mainnet.helius-rpc.com':300,
 };
 async function _domainThrottle(url) {
@@ -854,8 +853,8 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const data = await res.json().catch(() => null);
     if (res.status === 429 && _retries > 0) {
-      const delay = 350;
-      console.log(`   ⏳ 429 [${new URL(url).hostname}] — retry in ${delay}ms (${_retries} left)`);
+      const delay = 700;
+      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${delay}ms (${_retries} left)`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetchVerbose(url, options, label, _retries - 1);
     }
@@ -868,7 +867,7 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
   } catch (e) {
     const cause = e.cause?.code || e.cause?.message || e.code || '';
     const detail = cause ? ` [${cause}]` : '';
-    if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'ENOTFOUND')) {
+    if (_retries > 0 && e.code !== 'ENOTFOUND' && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT')) {
       const delay = 300 * (4 - _retries);
       console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
       await new Promise(r => setTimeout(r, delay));
@@ -937,7 +936,7 @@ async function getTokenPrice(mintAddress) {
     }
     solUsd = solUsd || 165; // Last resort hardcoded fallback (update monthly)
     const quote = await safeFetch(
-      `https://public.jupiterapi.com/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
+      `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
     );
     if (quote?.outAmount) {
       const tokensPerSol = parseInt(quote.outAmount) / (10 ** (quote.outputDecimals || 9));
