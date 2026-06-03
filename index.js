@@ -845,7 +845,8 @@ async function safeFetch(url, options = {}, _retries = 4) {
   }
 }
 
-async function safeFetchVerbose(url, options = {}, label = '') {
+async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
+  await _domainThrottle(url);
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const data = await res.json().catch(() => null);
@@ -856,7 +857,15 @@ async function safeFetchVerbose(url, options = {}, label = '') {
     }
     return data;
   } catch (e) {
-    console.log(`   ❌ ${label || 'fetch'} error: ${e.message}`);
+    const cause = e.cause?.code || e.cause?.message || e.code || '';
+    const detail = cause ? ` [${cause}]` : '';
+    if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT')) {
+      const delay = 1500 * (4 - _retries);
+      console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
+      await new Promise(r => setTimeout(r, delay));
+      return safeFetchVerbose(url, options, label, _retries - 1);
+    }
+    console.log(`   ❌ ${label || 'fetch'} error: ${e.message}${detail}`);
     return null;
   }
 }
