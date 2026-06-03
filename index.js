@@ -1,4 +1,4 @@
-// SOL BOT v9.7 - Launch filter bug fixed (was always skipping 8s-old tokens); scanner floors dropped; fast-stop 25%/4min
+// SOL BOT v9.8 - Quantum entanglement quant model (geometric coherence, multiplicative factors, 2× size on full alignment)
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -174,97 +174,107 @@ function patternWinRate(dim, key) {
 // === QUANTIFICATION ENGINE — score every signal 0-100 ===
 // ══════════════════════════════════════════════════════════════
 function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
-  let score = 0;
+  const factors = {};
   const reasons = [];
 
-  // — KOL component (0-40 pts) —
-  if (kolWallets && kolWallets.length > 0) {
+  // — KOL factor (0.0–1.0) —
+  if (kolWallets?.length > 0) {
     let totalWr = 0, n = 0;
     for (const w of kolWallets) {
       const s = kolScores.get(w);
-      if (s && s.trades >= 2) { totalWr += s.wins / s.trades; n++; }
-      else totalWr += 0.5, n++;
+      totalWr += (s && s.trades >= 2) ? s.wins / s.trades : 0.5;
+      n++;
     }
-    const avgWr = n ? totalWr / n : 0.5;
-    const kolPts = Math.round(avgWr * 40);
-    score += kolPts;
-    reasons.push(`KOL(${(avgWr * 100).toFixed(0)}%→${kolPts}pts)`);
+    factors.kol = n ? totalWr / n : 0.5;
+    reasons.push(`KOL(${(factors.kol*100).toFixed(0)}%)`);
   } else {
-    score += 20; // neutral for scanner-initiated
-    reasons.push('KOL(neutral→20pts)');
+    factors.kol = 0.56; // scanner neutral — slight positive bias
+    reasons.push('KOL(neutral)');
   }
 
-  // — Age component (0-20 pts) — freshest tokens = most momentum upside
+  // — Age factor (0.15–1.0) — freshness = momentum potential
   if (tokenInfo?.createdAt) {
-    const ageH = (Date.now() / 1000 - tokenInfo.createdAt) / 3600;
-    let agePts = ageH < 1 ? 20 : ageH < 2 ? 17 : ageH < 4 ? 13 : ageH < 8 ? 8 : 3;
-    score += agePts;
-    reasons.push(`age(${ageH.toFixed(1)}h→${agePts}pts)`);
+    const ageH = (Date.now()/1000 - tokenInfo.createdAt) / 3600;
+    factors.age = ageH < 0.5 ? 1.00
+                : ageH < 1   ? 0.95
+                : ageH < 2   ? 0.85
+                : ageH < 4   ? 0.70
+                : ageH < 8   ? 0.50
+                : ageH < 24  ? 0.32
+                :              0.15;
+    reasons.push(`age(${ageH.toFixed(1)}h→${(factors.age*100).toFixed(0)}%)`);
+  } else {
+    factors.age = 0.42; // unknown age — moderate
   }
 
-  // — Volume/Liquidity turnover (0-15 pts) —
-  if (tokenInfo?.v24hUSD && tokenInfo?.liquidity) {
+  // — Momentum factor (0.05–1.0) — primary conviction signal
+  const m5  = tokenInfo?.priceChange5mPercent || 0;
+  const m1h = tokenInfo?.priceChange1hPercent || 0;
+  if      (m5 >= 20 && m1h >= 30) factors.momentum = 1.00;
+  else if (m5 >= 10 && m1h >= 15) factors.momentum = 0.88;
+  else if (m5 >= 5  && m1h >= 8)  factors.momentum = 0.74;
+  else if (m5 >= 2  && m1h >= 3)  factors.momentum = 0.58;
+  else if (m5 >= 0  && m1h >= 0)  factors.momentum = 0.42;
+  else if (m5 >= -3 && m1h >= -5) factors.momentum = 0.28; // slight drift
+  else if (m5 < -5  || m1h < -10) factors.momentum = 0.07; // collapsing
+  else                             factors.momentum = 0.18;
+  reasons.push(`momentum(5m=${m5.toFixed(1)}%,1h=${m1h.toFixed(1)}%→${(factors.momentum*100).toFixed(0)}%)`);
+
+  // — Volume/Liquidity factor (0.10–1.0) — turnover = genuine interest
+  if (tokenInfo?.v24hUSD && tokenInfo?.liquidity > 0) {
     const ratio = tokenInfo.v24hUSD / tokenInfo.liquidity;
-    let vlPts = ratio >= 5 ? 15 : ratio >= 3 ? 12 : ratio >= 1.5 ? 8 : ratio >= 1 ? 5 : 2;
-    score += vlPts;
-    reasons.push(`V/L(${ratio.toFixed(1)}→${vlPts}pts)`);
+    factors.vl = ratio >= 8   ? 1.00
+               : ratio >= 5   ? 0.90
+               : ratio >= 3   ? 0.76
+               : ratio >= 1.5 ? 0.60
+               : ratio >= 0.5 ? 0.44
+               :                0.18;
+  } else {
+    factors.vl = tokenInfo?.v24hUSD > 0 ? 0.44 : 0.28;
   }
+  if (tokenInfo?.v24hUSD) reasons.push(`V/L(${(factors.vl*100).toFixed(0)}%)`);
 
-  // — Volume size (0-10 pts) —
-  if (tokenInfo?.v24hUSD) {
-    const vol = tokenInfo.v24hUSD;
-    let volPts = vol > 500000 ? 10 : vol > 200000 ? 8 : vol > 100000 ? 6 : vol > 50000 ? 4 : 2;
-    score += volPts;
-    reasons.push(`vol($${(vol/1000).toFixed(0)}K→${volPts}pts)`);
-  }
-
-  // — Pattern learning bonus (0-15 pts) — from historical win rates
+  // — Pattern learning factor (0.20–0.85) — self-calibrating from trade history
+  let patternFactor = 0.50;
   if (tokenInfo) {
-    const ageH = tokenInfo.createdAt ? (Date.now()/1000 - tokenInfo.createdAt)/3600 : null;
+    const ageH  = tokenInfo.createdAt ? (Date.now()/1000 - tokenInfo.createdAt)/3600 : null;
     const ratio = (tokenInfo.v24hUSD && tokenInfo.liquidity) ? tokenInfo.v24hUSD / tokenInfo.liquidity : null;
     const hour  = new Date().getHours();
-    const ab = ageH  != null ? ageBracket(ageH)     : null;
-    const vb = ratio != null ? volLiqBracket(ratio)  : null;
     const wr = [
-      ab ? patternWinRate('byAgeBracket',    ab)    : null,
-      vb ? patternWinRate('byVolLiqBracket', vb)    : null,
-      patternWinRate('byHourOfDay',  hour.toString()),
-      patternWinRate('bySource',     source),
+      ageH  != null ? patternWinRate('byAgeBracket',    ageBracket(ageH))    : null,
+      ratio != null ? patternWinRate('byVolLiqBracket', volLiqBracket(ratio)): null,
+      patternWinRate('byHourOfDay', hour.toString()),
+      patternWinRate('bySource',    source),
     ].filter(x => x !== null);
-    if (wr.length) {
-      const avgWr = wr.reduce((a, b) => a + b, 0) / wr.length;
-      const patPts = Math.round((avgWr - 0.5) * 30); // -15 to +15
-      score += patPts;
-      reasons.push(`pattern(${(avgWr*100).toFixed(0)}%→${patPts}pts)`);
-    }
+    if (wr.length) patternFactor = wr.reduce((a, b) => a + b, 0) / wr.length;
   }
+  factors.pattern = Math.max(0.20, Math.min(0.85, patternFactor));
+  reasons.push(`pattern(${(factors.pattern*100).toFixed(0)}%)`);
 
-  // — Momentum component (0-10 pts) — Profit Hunter: reward live upward momentum
-  if (PROFIT_HUNTER_MODE && tokenInfo) {
-    const m5  = tokenInfo.priceChange5mPercent  || 0;
-    const m1h = tokenInfo.priceChange1hPercent  || 0;
-    let momPts = 0;
-    if (m5 >= 15 && m1h >= 20)      momPts = 10;
-    else if (m5 >= 10 && m1h >= 10) momPts = 8;
-    else if (m5 >= 5  && m1h >= 5)  momPts = 5;
-    else if (m5 > 0   && m1h > 0)   momPts = 2;
-    else if (m5 < 0   || m1h < 0)   momPts = -5; // penalise falling tokens
-    if (momPts !== 0) {
-      score += momPts;
-      reasons.push(`momentum(5m=${m5.toFixed(1)}%,1h=${m1h.toFixed(1)}%→${momPts}pts)`);
-    }
+  // ═══════════════════════════════════════════════════════════
+  // ⛛  QUANTUM ENTANGLEMENT — Geometric coherence model
+  // Factors multiply together via weighted geometric mean.
+  // When all signals align, coherence compounds exponentially.
+  // Any collapsing dimension drags the whole score down.
+  // Momentum carries 35% weight (Profit Hunter bias); KOL 25%.
+  // ═══════════════════════════════════════════════════════════
+  const weights = { kol: 0.25, age: 0.18, momentum: 0.35, vl: 0.17, pattern: 0.05 };
+  let logSum = 0;
+  for (const [k, w] of Object.entries(weights)) {
+    logSum += w * Math.log(Math.max(0.01, factors[k]));
   }
+  const coherence = Math.exp(logSum); // 0.0–1.0
 
-  score = Math.max(0, Math.min(100, score));
+  const score = Math.round(coherence * 100);
 
-  // Determine position multiplier
+  // Assertive conviction thresholds — no half-measures
   let multiplier, action;
-  if (score >= 70)      { multiplier = 1.5; action = 'FULL+'; }
-  else if (score >= 50) { multiplier = 1.0; action = 'FULL';  }
-  else if (score >= 20) { multiplier = 0.7; action = 'HALF';  }
-  else                  { multiplier = 0;   action = 'SKIP';  }
+  if      (coherence >= 0.62) { multiplier = 2.0; action = 'FULL+'; } // all signals entangled → 2× size
+  else if (coherence >= 0.45) { multiplier = 1.2; action = 'FULL';  }
+  else if (coherence >= 0.28) { multiplier = 0.6; action = 'HALF';  }
+  else                        { multiplier = 0;   action = 'SKIP';  } // weak coherence = hard skip
 
-  console.log(`   📐 QUANT SCORE: ${score}/100 [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
+  console.log(`   ⛛  QUANTUM COHERENCE: ${(coherence*100).toFixed(1)}% [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
   return { score, multiplier, action };
 }
 
