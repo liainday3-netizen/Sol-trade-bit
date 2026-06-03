@@ -1,4 +1,4 @@
-// SOL BOT v10.1 - SNIPE ENGINE: launch snipe 200ms bypass-quant + graduation snipe 25% slippage + full flex mode
+// SOL BOT v10.2 - CONFIDENCE TIERS: FULL+(50% bal) / FULL(35%) / HALF(20%) + snipe engine + full flex
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -464,6 +464,7 @@ const profitHunterState = {
 const tradeHistory = [];
 const seenSignatures = new Set();
 let lastBuyTime = 0; // Cooldown tracker
+let currentAction = null; // Confidence action for active buy ('FULL+','FULL','HALF')
 
 // === CONSENSUS TRACKING ===
 // Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
@@ -480,7 +481,7 @@ const candidateKols = new Map(); // wallet -> { hits, seenTokens }
 // Position size = balance × BASE_RISK_PCT, capped at hard limits
 const BASE_RISK_PCT    = 0.28;   // flexed: 15%→28% of balance per trade
 const MIN_POSITION_SOL = 0.008;  // Never trade less than this
-const MAX_POSITION_SOL = 0.15;   // flexed: 0.08→0.15 hard cap
+const MAX_POSITION_SOL = 0.25;   // raised: allows 50% cap to express on balances up to 0.5 SOL
 const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
 const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
 const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
@@ -499,6 +500,13 @@ const SOFT_LOSS_TIER2          = 0.11;   // At 11% daily loss → 40% position s
 // --- FULL SCALING ---
 const KELLY_LOOKBACK_TRADES    = 25;     // Trades to use for Kelly Criterion
 const KELLY_FRACTION           = 0.70;   // flexed: 50%→70% fractional Kelly
+
+// Confidence-tiered balance caps — how much of balance each conviction level may use
+const CONFIDENCE_BALANCE_CAP = {
+  'FULL+': 0.50,  // ≥55% coherence → up to 50% of balance
+  'FULL':  0.35,  // ≥35% coherence → up to 35% of balance
+  'HALF':  0.20,  // ≥18% coherence → up to 20% of balance
+};
 const STREAK_SCALE_PCT         = 0.15;   // ±15% per win/loss streak tier
 const VOL_HIGH_THRESHOLD       = 50;     // >50% 1h change → reduce size 25%
 const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
@@ -559,7 +567,7 @@ function computeStreakMultiplier() {
   return 1.0;
 }
 
-function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null) {
+function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null, action = null) {
   resetDailyCounterIfNeeded();
 
   const bal = portfolio.balance;
@@ -593,6 +601,14 @@ function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null) {
   if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 2.0) {
     size = Math.min(size, bal * 0.05 * quantMultiplier);
     console.log(`   📈  PROFIT PROTECT (2× start) → capped at 5%`);
+  }
+
+  // Confidence-based balance ceiling (primary user rule)
+  const confCap = action ? (CONFIDENCE_BALANCE_CAP[action] ?? 0.20) : 0.50;
+  const confCeil = bal * confCap;
+  if (size > confCeil) {
+    console.log(`   🎯 CONFIDENCE CAP [${action||'default'}]: ${size.toFixed(4)} → ${confCeil.toFixed(4)} SOL (${(confCap*100).toFixed(0)}% bal)`);
+    size = confCeil;
   }
 
   // Hard bounds
@@ -1379,7 +1395,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Safety capital scale: override any passed-in size with scaled amount
   {
     const quantMul = 1.0; // quant multiplier already applied by caller
-    const safeSize = getScaledPositionSize(quantMul);
+    const safeSize = getScaledPositionSize(quantMul, null, currentAction);
     if (Math.abs(safeSize - solAmount) > 0.001) {
       console.log(`   🛡️  CAPITAL SCALE: ${solAmount.toFixed(4)} → ${safeSize.toFixed(4)} SOL (${(portfolio.balance*100).toFixed(1)}% balance = ${(safeSize/portfolio.balance*100).toFixed(1)}% risk)`);
     }
@@ -1928,14 +1944,18 @@ async function scanNewTokens(connection) {
       // Streak reinvestment — if on a hot streak, allow larger cap
       const streakCapMul = profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD ? PH_STREAK_CAP_BOOST : 1.0;
       if (streakCapMul > 1.0) console.log(`   🔥 STREAK BONUS: ${profitHunterState.consecutiveWins} wins → cap ×${streakCapMul}`);
-      const capSol = MAX_POSITION_SIZE_SOL * streakCapMul;
-      const tradeSize = Math.min(capSol * _sqMul * _sqSizeMul, portfolio.balance * 0.35); // flexed
+      currentAction = _sqAct;
+      const confBalCap = (CONFIDENCE_BALANCE_CAP[_sqAct] ?? 0.20) * portfolio.balance;
+      const capSol = Math.min(MAX_POSITION_SIZE_SOL * streakCapMul, confBalCap);
+      const tradeSize = Math.min(capSol * _sqSizeMul, confBalCap); // confidence-gated
       console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
       const bought = await buyToken(connection, addr, tradeSize, symbol);
       if (bought) break;
       continue;
     }
-    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul * _sqSizeMul, portfolio.balance * 0.30); // flexed
+    currentAction = _sqAct;
+    const _confCapSol = (CONFIDENCE_BALANCE_CAP[_sqAct] ?? 0.20) * portfolio.balance;
+    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqSizeMul, _confCapSol); // confidence-gated
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
     const bought = await buyToken(connection, addr, tradeSize, symbol);
     if (bought) break; // One independent trade per scan cycle
