@@ -1,4 +1,4 @@
-// SOL BOT v10.2 - CONFIDENCE TIERS: FULL+(50% bal) / FULL(35%) / HALF(20%) + snipe engine + full flex
+// SOL BOT v10.3 - RATE LIMIT FIX: domain throttle + exp backoff + SOL price cache + 22s scan interval
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -20,7 +20,7 @@ const TRAILING_STOP_PERCENT = 15;     // 20→15 — tighter lock once we're up
 const MAX_POSITION_SIZE_SOL = 0.07;   // flexed: 0.04→0.07 base hard cap
 const MAX_POSITIONS = 12;             // flexed: 8→12 concurrent positions
 const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
-const SCAN_INTERVAL = 15000;          // 30s→15s — 2× scan speed
+const SCAN_INTERVAL = 22000;          // raised 15s→22s to cut API 429 pressure
 const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
 const PRIORITY_FEE_LAMPORTS = 100000; // 50k→100k — faster inclusion
 const MIN_TRADE_COOLDOWN = 12000;     // flexed: 30s→12s — faster cycling
@@ -799,21 +799,46 @@ if (PRIVATE_KEY) {
 }
 
 // === HELPERS ===
-async function safeFetch(url, options = {}, _retries = 2) {
+// Per-domain rate throttle: enforces minimum gap between requests to same host
+const _domainLastCall = new Map();
+const DOMAIN_MIN_GAP_MS = {
+  'public-api.birdeye.so': 800,
+  'api.dexscreener.com':   600,
+  'api.jup.ag':            400,
+  'quote-api.jup.ag':      400,
+  'quote-api2.jup.ag':     400,
+  'mainnet.helius-rpc.com':300,
+};
+async function _domainThrottle(url) {
+  try {
+    const host = new URL(url).hostname;
+    const gap  = DOMAIN_MIN_GAP_MS[host];
+    if (!gap) return;
+    const last = _domainLastCall.get(host) || 0;
+    const wait = gap - (Date.now() - last);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    _domainLastCall.set(host, Date.now());
+  } catch {}
+}
+
+async function safeFetch(url, options = {}, _retries = 4) {
+  await _domainThrottle(url);
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     if (res.status === 429 && _retries > 0) {
-      const retryAfter = parseInt(res.headers.get('Retry-After') || '2', 10);
-      const delay = Math.min(retryAfter * 1000, 8000);
+      const retryAfter = parseInt(res.headers.get('Retry-After') || '3', 10);
+      const attempt    = 4 - _retries;
+      const delay      = Math.min(retryAfter * 1000 * Math.pow(2, attempt), 30000);
+      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${(delay/1000).toFixed(1)}s (${_retries} retries left)`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetch(url, options, _retries - 1);
     }
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
-    // Retry on network-level failures (DNS, TCP, timeout) — not just 429
     if (_retries > 0 && (e.code === 'ECONNRESET' || e.code === 'ENOTFOUND' || e.code === 'ETIMEDOUT' || e.message?.includes('fetch failed') || e.message?.includes('terminated'))) {
-      await new Promise(r => setTimeout(r, 1500));
+      const delay = 1500 * (5 - _retries);
+      await new Promise(r => setTimeout(r, delay));
       return safeFetch(url, options, _retries - 1);
     }
     return null;
@@ -2255,8 +2280,11 @@ async function main() {
     const time = new Date().toLocaleTimeString();
     console.log(`🔥 SCANNING... ${time}`);
 
-    // 1. Check SOL price (heartbeat) — multi-source with fallback
+    // 1. Check SOL price (heartbeat) — cached 45s to reduce Birdeye calls
     let solUsdPrice = null;
+    if (global._solPriceCache && Date.now() - global._solPriceCacheAt < 45000) {
+      solUsdPrice = global._solPriceCache;
+    }
     // Try Birdeye
     const solPriceData = await safeFetch(
       `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
@@ -2284,6 +2312,7 @@ async function main() {
       solUsdPrice = jupData?.data?.[SOL_MINT]?.price ? parseFloat(jupData.data[SOL_MINT].price) : null;
     }
     if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
+      global._solPriceCache = solUsdPrice; global._solPriceCacheAt = Date.now();
       console.log(`   SOL: ${parseFloat(solUsdPrice).toFixed(2)}`);
     } else {
       console.log(`   SOL: price unavailable from all sources`);
