@@ -799,14 +799,19 @@ if (PRIVATE_KEY) {
 }
 
 // === HELPERS ===
-// Per-domain rate throttle: enforces minimum gap between requests to same host
-const _domainLastCall = new Map();
+// Per-domain serialized throttle — promise-chain queue.
+// OLD design used a Map timestamp: all N concurrent callers read the same lastCall,
+// computed wait=0, and fired simultaneously → Railway drops connections (fetch failed).
+// NEW design: each caller appends a gap-delay onto the tail of a per-domain promise
+// chain, then awaits the PREVIOUS tail. This serializes callers so only one
+// request per domain is in-flight at a time, spaced by gap ms.
+const _domainTails = {};
 const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
-  'api.jup.ag':            700,  // raised from 400 — reduces 429s under concurrent snipes
-  'quote-api.jup.ag':      400,
-  'quote-api2.jup.ag':     400,
+  'api.jup.ag':            700,
+  'quote-api.jup.ag':      500,
+  'quote-api2.jup.ag':     500,
   'mainnet.helius-rpc.com':300,
 };
 async function _domainThrottle(url) {
@@ -814,10 +819,9 @@ async function _domainThrottle(url) {
     const host = new URL(url).hostname;
     const gap  = DOMAIN_MIN_GAP_MS[host];
     if (!gap) return;
-    const last = _domainLastCall.get(host) || 0;
-    const wait = gap - (Date.now() - last);
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
-    _domainLastCall.set(host, Date.now());
+    const tail = _domainTails[host] ?? Promise.resolve();
+    _domainTails[host] = tail.then(() => new Promise(r => setTimeout(r, gap)));
+    await tail; // wait for all previous callers' gaps to drain first
   } catch {}
 }
 
