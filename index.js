@@ -1,4 +1,4 @@
-// SOL BOT v9.9 - Jupiter bug fix: BC tokens never routed to Jupiter; blockhash pre-fetch; swap URL fallback; cache invalidation
+// SOL BOT v10.0 - FLEX MODE: BASE_RISK 28%, MAX_POS 0.07, 12s cooldown, 12 concurrent, MICRO tier, quant 2.8×/1.7×/0.9×, thresholds 55%/35%/18%
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -17,13 +17,13 @@ const MEMORY_FILE  = 'memory.json';
 const STOP_LOSS_PERCENT = 35;         // 30→35 — more room for volatile memecoins
 const TAKE_PROFIT_PERCENT = 250;      // 150→250 — let moonshots go further
 const TRAILING_STOP_PERCENT = 15;     // 20→15 — tighter lock once we're up
-const MAX_POSITION_SIZE_SOL = 0.04;   // 0.03→0.04 (base; scales dynamically)
-const MAX_POSITIONS = 8;              // 5→8 concurrent positions
+const MAX_POSITION_SIZE_SOL = 0.07;   // flexed: 0.04→0.07 base hard cap
+const MAX_POSITIONS = 12;             // flexed: 8→12 concurrent positions
 const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
 const SCAN_INTERVAL = 15000;          // 30s→15s — 2× scan speed
 const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
 const PRIORITY_FEE_LAMPORTS = 100000; // 50k→100k — faster inclusion
-const MIN_TRADE_COOLDOWN = 30000;     // 60s→30s — catch rapid cycles
+const MIN_TRADE_COOLDOWN = 12000;     // flexed: 30s→12s — faster cycling
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
@@ -270,9 +270,9 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
 
   // Assertive conviction thresholds — no half-measures
   let multiplier, action;
-  if      (coherence >= 0.62) { multiplier = 2.0; action = 'FULL+'; } // all signals entangled → 2× size
-  else if (coherence >= 0.45) { multiplier = 1.2; action = 'FULL';  }
-  else if (coherence >= 0.28) { multiplier = 0.6; action = 'HALF';  }
+  if      (coherence >= 0.55) { multiplier = 2.8; action = 'FULL+'; } // flexed: 62%→55%, 2.0×→2.8×
+  else if (coherence >= 0.35) { multiplier = 1.7; action = 'FULL';  } // flexed: 45%→35%, 1.2×→1.7×
+  else if (coherence >= 0.18) { multiplier = 0.9; action = 'HALF';  } // flexed: 28%→18%, 0.6×→0.9×
   else                        { multiplier = 0;   action = 'SKIP';  } // weak coherence = hard skip
 
   console.log(`   ⛛  QUANTUM COHERENCE: ${(coherence*100).toFixed(1)}% [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
@@ -463,9 +463,9 @@ const candidateKols = new Map(); // wallet -> { hits, seenTokens }
 // === SAFETY CAPITAL SCALE ENGINE ===
 // ══════════════════════════════════════════════════════════════
 // Position size = balance × BASE_RISK_PCT, capped at hard limits
-const BASE_RISK_PCT    = 0.15;   // 12%→15% of balance per trade
+const BASE_RISK_PCT    = 0.28;   // flexed: 15%→28% of balance per trade
 const MIN_POSITION_SOL = 0.008;  // Never trade less than this
-const MAX_POSITION_SOL = 0.08;   // Hard cap regardless of balance
+const MAX_POSITION_SOL = 0.15;   // flexed: 0.08→0.15 hard cap
 const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
 const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
 const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
@@ -483,7 +483,7 @@ const SOFT_LOSS_TIER2          = 0.11;   // At 11% daily loss → 40% position s
 
 // --- FULL SCALING ---
 const KELLY_LOOKBACK_TRADES    = 25;     // Trades to use for Kelly Criterion
-const KELLY_FRACTION           = 0.50;   // 40%→50% fractional Kelly (more aggressive)
+const KELLY_FRACTION           = 0.70;   // flexed: 50%→70% fractional Kelly
 const STREAK_SCALE_PCT         = 0.15;   // ±15% per win/loss streak tier
 const VOL_HIGH_THRESHOLD       = 50;     // >50% 1h change → reduce size 25%
 const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
@@ -569,8 +569,8 @@ function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null) {
   console.log(`   📊 SIZE BUILD: base=${(bal*BASE_RISK_PCT).toFixed(4)} Kelly×${kellyMul.toFixed(2)} streak×${streakMul.toFixed(2)} soft×${softMul.toFixed(2)} vol×${volMul.toFixed(2)} quant×${quantMultiplier.toFixed(2)} → ${size.toFixed(4)} SOL`);
 
   // Conservative mode: balance < 85% of start → hard clamp
-  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.85) {
-    size = Math.min(size, bal * 0.06 * quantMultiplier);
+  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.75) {
+    size = Math.min(size, bal * 0.12 * quantMultiplier);
     console.log(`   🛡️  CONSERVATIVE MODE (balance -15% from start) → capped`);
   }
 
@@ -703,9 +703,9 @@ function getDynamicPositionSize(triggeringWallets) {
   for (const w of triggeringWallets) { total += getKolScore(w); n++; }
   const avgScore = n ? total / n : 0.5;
   // Low-confidence KOL (score<0.4) → 0.5× size; high-confidence (>0.7) → 1.3× size
-  const multiplier = Math.max(0.5, Math.min(1.3, avgScore * 1.6));
+  const multiplier = Math.max(0.5, Math.min(2.0, avgScore * 2.4));  // flexed: cap 1.3→2.0
   const size = MAX_POSITION_SIZE_SOL * multiplier;
-  return Math.min(size, portfolio.balance * 0.2); // never >20% of balance
+  return Math.min(size, portfolio.balance * 0.32); // flexed: never >32% of balance
 }
 
 function updateKolScore(wallet, won, pnlPercent) {
@@ -1888,7 +1888,7 @@ async function scanNewTokens(connection) {
 
     // Ghost-liquidity tokens: route engine handles bonding curve detection automatically
     if (isGhostLiq) {
-      const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.50, portfolio.balance * 0.10);
+      const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.85, portfolio.balance * 0.20); // flexed
       console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → route engine`);
       const ghostResult = await routeEngine(connection, addr, ghostSize, symbol);
       if (ghostResult) {
@@ -1914,13 +1914,13 @@ async function scanNewTokens(connection) {
       const streakCapMul = profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD ? PH_STREAK_CAP_BOOST : 1.0;
       if (streakCapMul > 1.0) console.log(`   🔥 STREAK BONUS: ${profitHunterState.consecutiveWins} wins → cap ×${streakCapMul}`);
       const capSol = MAX_POSITION_SIZE_SOL * streakCapMul;
-      const tradeSize = Math.min(capSol * _sqMul * _sqSizeMul, portfolio.balance * 0.20);
+      const tradeSize = Math.min(capSol * _sqMul * _sqSizeMul, portfolio.balance * 0.35); // flexed
       console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
       const bought = await buyToken(connection, addr, tradeSize, symbol);
       if (bought) break;
       continue;
     }
-    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul * _sqSizeMul, portfolio.balance * 0.18);
+    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul * _sqSizeMul, portfolio.balance * 0.30); // flexed
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
     const bought = await buyToken(connection, addr, tradeSize, symbol);
     if (bought) break; // One independent trade per scan cycle
@@ -2015,14 +2015,15 @@ function showStatus() {
 function getScaledLimits() {
   const bal = portfolio.balance;
   // Each tier unlocks larger positions, more concurrent slots, faster cycling
-  if (bal >= 100.0) return { maxPosSol: bal * 0.030, maxConc: 25, cooldown: 10000, label: '🌍 TITAN' };
-  if (bal >= 50.0)  return { maxPosSol: bal * 0.035, maxConc: 20, cooldown: 12000, label: '🌏 MACRO' };
-  if (bal >= 20.0)  return { maxPosSol: bal * 0.040, maxConc: 16, cooldown: 15000, label: '🌐 SCALE' };
-  if (bal >= 10.0)  return { maxPosSol: bal * 0.045, maxConc: 14, cooldown: 18000, label: '🔥 SURGE' };
-  if (bal >= 5.0)   return { maxPosSol: bal * 0.050, maxConc: 12, cooldown: 22000, label: '⚡ STORM' };
-  if (bal >= 2.0)   return { maxPosSol: bal * 0.055, maxConc: 10, cooldown: 26000, label: '🚀 BOOST' };
-  if (bal >= 1.0)   return { maxPosSol: bal * 0.060, maxConc:  9, cooldown: 28000, label: '💫 GROW'  };
-  if (bal >= 0.5)   return { maxPosSol: bal * 0.070, maxConc:  8, cooldown: 30000, label: '🌱 SEED'  };
+  if (bal >= 100.0) return { maxPosSol: bal * 0.045, maxConc: 28, cooldown: 10000, label: '🌍 TITAN' };
+  if (bal >= 50.0)  return { maxPosSol: bal * 0.052, maxConc: 23, cooldown: 12000, label: '🌏 MACRO' };
+  if (bal >= 20.0)  return { maxPosSol: bal * 0.058, maxConc: 20, cooldown: 15000, label: '🌐 SCALE' };
+  if (bal >= 10.0)  return { maxPosSol: bal * 0.065, maxConc: 17, cooldown: 18000, label: '🔥 SURGE' };
+  if (bal >= 5.0)   return { maxPosSol: bal * 0.075, maxConc: 15, cooldown: 22000, label: '⚡ STORM' };
+  if (bal >= 2.0)   return { maxPosSol: bal * 0.080, maxConc: 13, cooldown: 26000, label: '🚀 BOOST' };
+  if (bal >= 1.0)   return { maxPosSol: bal * 0.085, maxConc: 11, cooldown: 28000, label: '💫 GROW'  };
+  if (bal >= 0.5)   return { maxPosSol: bal * 0.100, maxConc: 10, cooldown: 22000, label: '🌱 SEED'  };
+  if (bal >= 0.15)  return { maxPosSol: bal * 0.130, maxConc:  9, cooldown: 16000, label: '🔬 MICRO' };
   // Base case: current config
   return { maxPosSol: MAX_POSITION_SIZE_SOL, maxConc: MAX_POSITIONS, cooldown: MIN_TRADE_COOLDOWN, label: '⚙️ BASE' };
 }
@@ -2097,7 +2098,7 @@ async function startPumpLaunchSubscription(connection) {
 
       const sym = info?.symbol || mintAddr.slice(0,8);
       // Launch size: 60% of normal max (unproven, reduce risk)
-      const launchSize = Math.min(scaleLimits.maxPosSol * 0.60, portfolio.balance * 0.12);
+      const launchSize = Math.min(scaleLimits.maxPosSol * 0.90, portfolio.balance * 0.25); // flexed
       console.log(`   🚀🌍 PLANETARY LAUNCH BUY: ${sym} | size=${launchSize.toFixed(4)} SOL | score=${_lFinal} | AI=${_lVerdict}`);
 
       // Route engine: detects active bonding curve → pump.fun direct first, Jupiter fallback
