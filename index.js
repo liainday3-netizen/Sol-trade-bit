@@ -28,10 +28,9 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL      = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_QUOTE_URL_ALT  = 'https://api.jup.ag/swap/v1/quote';
-const JUPITER_SWAP_URL       = 'https://quote-api.jup.ag/v6/swap';
-const JUPITER_SWAP_URL_ALT   = 'https://api.jup.ag/swap/v1/swap';
+const JUPITER_QUOTE_URL  = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_URL   = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_TIMEOUT_MS = 5000;
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -809,8 +808,7 @@ const _domainTails = {};
 const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
-  'api.jup.ag':            700,
-  'quote-api.jup.ag':      300,
+  'quote-api.jup.ag':      500,
   'quote-api2.jup.ag':     500,
   'mainnet.helius-rpc.com':300,
 };
@@ -849,13 +847,13 @@ async function safeFetch(url, options = {}, _retries = 4) {
   }
 }
 
-async function safeFetchVerbose(url, options = {}, label = '', _retries = 6) {
+async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
   await _domainThrottle(url);
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const data = await res.json().catch(() => null);
     if (res.status === 429 && _retries > 0) {
-      const delay = 600;
+      const delay = 350;
       console.log(`   ⏳ 429 [${new URL(url).hostname}] — retry in ${delay}ms (${_retries} left)`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetchVerbose(url, options, label, _retries - 1);
@@ -870,7 +868,7 @@ async function safeFetchVerbose(url, options = {}, label = '', _retries = 6) {
     const cause = e.cause?.code || e.cause?.message || e.code || '';
     const detail = cause ? ` [${cause}]` : '';
     if (_retries > 0 && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'ENOTFOUND')) {
-      const delay = 400 * (7 - _retries);
+      const delay = 300 * (4 - _retries);
       console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
       await new Promise(r => setTimeout(r, delay));
       return safeFetchVerbose(url, options, label, _retries - 1);
@@ -997,14 +995,7 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBp
     asLegacyTransaction: 'false',
   });
 
-  // Race primary and alt — first success wins
-  const [primary, alt] = await Promise.allSettled([
-    safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`),
-    safeFetchVerbose(`${JUPITER_QUOTE_URL_ALT}?${params}`, {}, `Jupiter quote alt (${slippage/100}%slip)`),
-  ]);
-  const quote = (primary.status === 'fulfilled' && primary.value)
-    || (alt.status === 'fulfilled' && alt.value)
-    || null;
+  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`);
   if (!quote) return null;
   // Jupiter returns HTTP 200 but with error field when no route exists
   if (quote.error || !quote.outAmount) {
@@ -1057,13 +1048,9 @@ async function executeJupiterSwap(connection, quote) {
   });
   const swapOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: swapBody };
 
-  let swapResponse = await safeFetch(JUPITER_SWAP_URL, swapOpts);
+  const swapResponse = await safeFetch(JUPITER_SWAP_URL, swapOpts);
   if (!swapResponse?.swapTransaction) {
-    console.log('   🔄 Primary swap endpoint failed — trying fallback...');
-    swapResponse = await safeFetch(JUPITER_SWAP_URL_ALT, swapOpts);
-  }
-  if (!swapResponse?.swapTransaction) {
-    console.log('   ❌ Jupiter swap TX build failed (both endpoints)');
+    console.log('   ❌ Jupiter swap TX build failed');
     return null;
   }
 
@@ -1182,27 +1169,32 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
     ? [1000, 3000, 5000]           // just graduated: 10% → 30% → 50% (thin books)
     : [300, 500, 1000, 3000, 5000]; // established: 3% → 5% → 10% → 30% → 50%
 
-  console.log(`   🎯 ROUTE B: Jupiter (${slippageRamp.map(b => b/100 + '%').join('→')})`);
+  console.log(`   🎯 ROUTE B: Jupiter (${slippageRamp.map(b => b/100 + '%').join('→')}, ${JUPITER_TIMEOUT_MS/1000}s cap)`);
 
-  for (let i = 0; i < slippageRamp.length; i++) {
-    const slipBps = slippageRamp[i];
-    if (i > 0) {
-      await new Promise(r => setTimeout(r, 1500));
-      console.log(`   🔄 Jupiter retry at ${slipBps / 100}%...`);
-    }
-    const q = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports, slipBps);
-    if (!q) continue;
-    const sig = await executeJupiterSwap(connection, q);
-    if (sig) {
-      routeStats.jupiterSwap.ok++;
-      const tokensOut = parseInt(q.outAmount) / 1e6; // 6 decimals (standard SPL meme)
-      const price = tokensOut > 0 ? solAmount / tokensOut : 0;
-      console.log(`   ✅ ROUTE B success (${slipBps / 100}% slippage)`);
-      return { sig, tokensOut, price };
-    }
+  const _jupResult = await Promise.race([
+    (async () => {
+      for (let i = 0; i < slippageRamp.length; i++) {
+        const slipBps = slippageRamp[i];
+        if (i > 0) console.log(`   🔄 ${slipBps / 100}% slip...`);
+        const q = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports, slipBps);
+        if (!q) continue;
+        const sig = await executeJupiterSwap(connection, q);
+        if (sig) return { sig, q, slipBps };
+      }
+      return null;
+    })(),
+    new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS)),
+  ]);
+  if (_jupResult) {
+    const { sig, q, slipBps } = _jupResult;
+    routeStats.jupiterSwap.ok++;
+    const tokensOut = parseInt(q.outAmount) / 1e6;
+    const price = tokensOut > 0 ? solAmount / tokensOut : 0;
+    console.log(`   ✅ ROUTE B success (${slipBps / 100}% slippage)`);
+    return { sig, tokensOut, price };
   }
   routeStats.jupiterSwap.fail++;
-  console.log(`   ⚠️  ROUTE B failed — all Jupiter tiers exhausted`);
+  console.log(`   ⚠️  ROUTE B: timed out or all tiers failed`);
 
   // Route C: last-resort pump.fun (no BC detected — DexScreener might have missed it)
   if (!hasBondingCurve) {
