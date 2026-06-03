@@ -28,10 +28,10 @@ const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL      = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_QUOTE_URL_ALT  = 'https://api.jup.ag/swap/v1/quote';  // fallback endpoint
-const JUPITER_SWAP_URL       = 'https://quote-api.jup.ag/v6/swap';
-const JUPITER_SWAP_URL_ALT   = 'https://api.jup.ag/swap/v1/swap';   // fallback swap endpoint
+const JUPITER_QUOTE_URL      = 'https://api.jup.ag/swap/v1/quote';           // primary (stable on Railway)
+const JUPITER_QUOTE_URL_ALT  = 'https://quote-api.jup.ag/v6/quote';          // fallback
+const JUPITER_SWAP_URL       = 'https://api.jup.ag/swap/v1/swap';            // primary (stable on Railway)
+const JUPITER_SWAP_URL_ALT   = 'https://quote-api.jup.ag/v6/swap';           // fallback
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -804,7 +804,7 @@ const _domainLastCall = new Map();
 const DOMAIN_MIN_GAP_MS = {
   'public-api.birdeye.so': 800,
   'api.dexscreener.com':   600,
-  'api.jup.ag':            400,
+  'api.jup.ag':            700,  // raised from 400 — reduces 429s under concurrent snipes
   'quote-api.jup.ag':      400,
   'quote-api2.jup.ag':     400,
   'mainnet.helius-rpc.com':300,
@@ -1406,8 +1406,18 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
 
     const sim2 = await silentSim(vtx);
     if (sim2.value.err) {
-      console.log(`   ❌ pump.fun old layout sim also failed: ${JSON.stringify(sim2.value.err)} — cannot route via bonding curve`);
-      return null;
+      const err2 = JSON.stringify(sim2.value.err);
+      // ProgramAccountNotFound = account hasn't propagated to RPC yet (timing at launch).
+      // Safe to send new layout directly — skipPreflight means on-chain execution decides.
+      // Any other sim error = genuine problem, bail.
+      if (err2.includes('ProgramAccountNotFound')) {
+        console.log(`   ⚠️  pump.fun both sims: ProgramAccountNotFound — sending new layout direct (account lag)`);
+        vtx = buildVtx(buildBuyIx(true), blockhash); // revert to new layout for send
+        layoutLabel = 'new (creator-vault, direct)';
+      } else {
+        console.log(`   ❌ pump.fun old layout sim also failed: ${err2} — cannot route via bonding curve`);
+        return null;
+      }
     }
     console.log(`   ✅ pump.fun old layout sim passed — sending`);
   }
