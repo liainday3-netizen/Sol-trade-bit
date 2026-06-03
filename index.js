@@ -1,4 +1,4 @@
-// SOL BOT v10.5 - slow it down: single snipe, 1s launch delay, quote-api.jup.ag DNS fix, ENOTFOUND fast-fail
+// SOL BOT v10.6 - stabilize: pump.fun direct sell, Route C before Jupiter, BC account retry
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -37,7 +37,8 @@ const JUPITER_TIMEOUT_MS = 8000;
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const TOKEN_SPL_PROGRAM  = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const PUMP_BUY_DISCRIMINATOR  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const PUMP_SELL_DISCRIMINATOR = Buffer.from([ 51,230,133,164,  1,127,131,173]);  // anchor hash for pump.fun sell
 
 // ═══════════════════════════════════════════════════════════════
 // === SNIPE MODE ===
@@ -401,7 +402,15 @@ async function getBondingCurveInfo(connection, tokenMint) {
     const [bondingCurveAddr] = PublicKey.findProgramAddressSync(
       [Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM
     );
-    const bcInfo = await connection.getAccountInfo(bondingCurveAddr);
+    let bcInfo = await connection.getAccountInfo(bondingCurveAddr);
+    // Retry up to 3x (80ms each) — fresh launch accounts take time to propagate to RPC
+    if (!bcInfo) {
+      for (let _r = 0; _r < 3; _r++) {
+        await new Promise(_res => setTimeout(_res, 80));
+        bcInfo = await connection.getAccountInfo(bondingCurveAddr);
+        if (bcInfo) { console.log(`   🔄 BC account found on retry ${_r+1}`); break; }
+      }
+    }
     const result = {
       hasBondingCurve: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)),
       bcComplete: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM) && bcInfo.data[48] === 1),
@@ -1176,6 +1185,21 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
   // JUPITER PATH — graduated or DEX-listed tokens only
   // Wider slippage for newly graduated tokens (thin books).
   // ══════════════════════════════════════════════════
+  // ROUTE C (early): when BC detection returned false, try pump.fun direct FIRST.
+  // On Railway, getAccountInfo can return null for brand-new tokens (account lag).
+  // Trying Jupiter first wastes 8s; pump.fun direct only costs ~200ms.
+  if (!hasBondingCurve) {
+    console.log(`   🎯 ROUTE C (early): pump.fun direct (BC returned false — may be RPC lag)`);
+    const pumpEarlyResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (pumpEarlyResult) {
+      routeStats.pumpFunDirect.ok++;
+      console.log(`   ✅ ROUTE C (early) success`);
+      return pumpEarlyResult;
+    }
+    routeStats.pumpFunDirect.fail++;
+    console.log(`   ⚠️  ROUTE C (early) failed — falling back to Jupiter`);
+  }
+
   const justGraduated = hasBondingCurve && bcComplete;
   const slippageRamp = justGraduated
     ? [1000, 3000, 5000]           // just graduated: 10% → 30% → 50% (thin books)
@@ -1208,7 +1232,7 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
   routeStats.jupiterSwap.fail++;
   console.log(`   ⚠️  ROUTE B: timed out or all tiers failed`);
 
-  // Route C: last-resort pump.fun (no BC detected — DexScreener might have missed it)
+  // Route C (early) already tried before Jupiter — if we reach here, both failed.
   if (!hasBondingCurve) {
     console.log(`   🎯 ROUTE C: last-resort pump.fun (DexScreener may have missed BC)`);
     const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
@@ -1578,7 +1602,114 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   return true;
 }
 
-// === SELL TOKEN (Jupiter) ===
+
+// ══════════════════════════════════════════════════════════════
+// === PUMP.FUN DIRECT SELL ===
+// Sells tokens back to the bonding curve without Jupiter.
+// Only works when the token is still on an active bonding curve (not yet graduated).
+// Returns { sig, solReceived } or null on failure.
+// ══════════════════════════════════════════════════════════════
+async function sellPumpFunDirect(connection, tokenMint, tokenAmount, decimals) {
+  try {
+    const mint = new PublicKey(tokenMint);
+    const [bondingCurve]   = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
+    const [globalPDA]      = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
+    const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
+
+    const bcInfo = await connection.getAccountInfo(bondingCurve);
+    if (!bcInfo || !bcInfo.owner.equals(PUMP_PROGRAM)) {
+      console.log('   ⚠️  sellPumpFunDirect: no active BC — token may have graduated');
+      return null;
+    }
+    const buf = bcInfo.data;
+    if (buf[48] === 1) {
+      console.log('   ⚠️  sellPumpFunDirect: BC complete — token graduated, use Jupiter');
+      return null;
+    }
+
+    const virtualTokenReserves = buf.readBigUInt64LE(8);
+    const virtualSolReserves   = buf.readBigUInt64LE(16);
+    const amountRaw = BigInt(Math.floor(tokenAmount * (10 ** decimals)));
+
+    // Bonding curve sell math: solOut = vSolRes * amount / (vTokRes + amount)
+    const expectedSolOut = (virtualSolReserves * amountRaw) / (virtualTokenReserves + amountRaw);
+    const minSolOutput   = expectedSolOut * 90n / 100n;  // 10% slippage tolerance
+
+    // Read fee recipient from global state
+    let feeRecipient;
+    const globalInfo = await getCachedGlobalInfo(connection, globalPDA);
+    if (globalInfo && globalInfo.data.length >= 73) {
+      feeRecipient = new PublicKey(globalInfo.data.slice(41, 73));
+    } else {
+      feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
+    }
+
+    // Creator vault
+    let creatorVault;
+    try {
+      const creator = new PublicKey(buf.slice(49, 81));
+      [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
+    } catch (e) {
+      console.log(`   ❌ sellPumpFunDirect: creator vault PDA failed: ${e.message}`);
+      return null;
+    }
+
+    const tokenProg              = await getCachedTokenProg(connection, mint);
+    const associatedBondingCurve = getATA(bondingCurve, mint, true,  tokenProg);
+    const associatedUser         = getATA(keypair.publicKey, mint, false, tokenProg);
+
+    // Build sell instruction data: discriminator(8) + tokenAmount(u64) + minSolOutput(u64)
+    const data = Buffer.alloc(24);
+    PUMP_SELL_DISCRIMINATOR.copy(data, 0);
+    data.writeBigUInt64LE(amountRaw,    8);
+    data.writeBigUInt64LE(minSolOutput, 16);
+
+    const sellIx = new TransactionInstruction({
+      programId: PUMP_PROGRAM,
+      keys: [
+        { pubkey: globalPDA,              isSigner: false, isWritable: false },
+        { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
+        { pubkey: mint,                   isSigner: false, isWritable: false },
+        { pubkey: bondingCurve,           isSigner: false, isWritable: true  },
+        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true  },
+        { pubkey: associatedUser,         isSigner: false, isWritable: true  },
+        { pubkey: keypair.publicKey,      isSigner: true,  isWritable: true  },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: tokenProg,              isSigner: false, isWritable: false },
+        { pubkey: creatorVault,           isSigner: false, isWritable: true  },
+        { pubkey: eventAuthority,         isSigner: false, isWritable: false },
+        { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    const msg = new TransactionMessage({
+      payerKey: keypair.publicKey,
+      recentBlockhash: blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }),
+        sellIx,
+      ],
+    }).compileToV0Message();
+    const vtx = new VersionedTransaction(msg);
+    vtx.sign([keypair]);
+
+    const sig = await connection.sendRawTransaction(vtx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    const solReceived = Number(expectedSolOut) / LAMPORTS_PER_SOL;
+    console.log(`   ✅ sellPumpFunDirect: ${tokenAmount.toFixed(0)} tokens → ${solReceived.toFixed(4)} SOL | ${sig.slice(0, 12)}...`);
+    return { sig, solReceived };
+  } catch (e) {
+    console.log(`   ❌ sellPumpFunDirect failed: ${e.message?.slice(0, 100)}`);
+    return null;
+  }
+}
+
+// === SELL TOKEN (Jupiter + pump.fun direct fallback) ===
 async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const position = positions.get(tokenMint);
   if (!position) return false;
@@ -1619,7 +1750,34 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const decimals = tokenInfo?.decimals || 9;
   const amountRaw = Math.floor(position.amount * (10 ** decimals));
 
-  // Escalating slippage on sell — memecoin liquidity is thin; 3% alone fails constantly
+  // --- SELL ROUTE A: pump.fun direct (if token still on bonding curve) ---
+  // Avoids Jupiter entirely for BC tokens — critical on Railway where Jupiter DNS is unreliable
+  const bcInfoForSell = await getBondingCurveInfo(connection, tokenMint);
+  if (bcInfoForSell.hasBondingCurve && !bcInfoForSell.bcComplete) {
+    console.log(`🎯 SELL ROUTE A: pump.fun direct (active BC) — ${position.symbol} (${reason})`);
+    const directSell = await sellPumpFunDirect(connection, tokenMint, position.amount, decimals);
+    if (directSell) {
+      const pnlSol = directSell.solReceived - position.solInvested;
+      portfolio.balance += directSell.solReceived;
+      portfolio.totalPnl += pnlSol;
+      if (position.triggeredBy) {
+        const won = pnlPercent > 0;
+        for (const w of position.triggeredBy) updateKolScore(w, won, pnlPercent);
+      }
+      positions.delete(tokenMint);
+      logTrade(`📕 SELL [BC] (${reason})`, position.symbol, currentPrice, pnlPercent);
+      console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
+      recordTradeForSafety(pnlSol, pnlPercent);
+      try {
+        const _cp = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
+        recordPatternOutcome(_cp); saveMemory(_cp);
+      } catch {}
+      return true;
+    }
+    console.log(`   ⚠️  SELL ROUTE A failed — falling back to Jupiter`);
+  }
+
+  // --- SELL ROUTE B: Jupiter (graduated tokens or when BC sell fails) ---
   console.log(`🔄 Getting sell quote: ${position.symbol} → SOL (${reason})`);
   const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
   const _sellQ = await Promise.race([
