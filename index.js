@@ -1207,12 +1207,12 @@ async function scanNewTokens(connection) {
     // FILTERS — fresh momentum only:
     if (liq < 30000)      { console.log(`      ↳ skip: low liq`);        continue; }
     if (vol24h < 50000)   { console.log(`      ↳ skip: low vol`);         continue; }
-    if (ageHours > 8)     { console.log(`      ↳ skip: too old`);         continue; }
+    if (ageHours > 16)     { console.log(`      ↳ skip: too old`);         continue; }
     if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
     if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
     const { multiplier: _sqMul, action: _sqAct } = quantifySignal([], info, 'scanner');
-    if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
+    //if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
     console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters!`);
     const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul, portfolio.balance * 0.15);
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
