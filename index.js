@@ -1,60 +1,40 @@
-// SOL BOT v10.6 - stabilize: pump.fun direct sell, Route C before Jupiter, BC account retry
-import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
+// SOL BOT v5.1 - Copy Trading + Jupiter Swap Execution + Risk Management
+import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // === CONFIG ===
-const HELIUS_KEY  = process.env.HELIUS_API_KEY || '';
-const BACKUP_RPC  = process.env.BACKUP_RPC_URL  || 'https://api.mainnet-beta.solana.com';
+const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
 const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is set
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const GROQ_KEY     = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || ''; // Groq (free) preferred; falls back to OpenAI key if present
 const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
 
-// === RISK MANAGEMENT — v9.0 PLANETARY SCALE ===
-const STOP_LOSS_PERCENT = 35;         // 30→35 — more room for volatile memecoins
-const TAKE_PROFIT_PERCENT = 250;      // 150→250 — let moonshots go further
-const TRAILING_STOP_PERCENT = 15;     // 20→15 — tighter lock once we're up
-const MAX_POSITION_SIZE_SOL = 0.07;   // flexed: 0.04→0.07 base hard cap
-const MAX_POSITIONS = 5;              // conservative: max 5 held positions
-const PRICE_CHECK_INTERVAL = 4000;    // 5s→4s faster exit trigger
-const SCAN_INTERVAL = 22000;          // raised 15s→22s to cut API 429 pressure
-const SLIPPAGE_BPS = 300;             // base; Jupiter escalates 3%→5%→10%
-const PRIORITY_FEE_LAMPORTS = 200000; // boosted 200k — better TX inclusion on congested launches
-const MIN_TRADE_COOLDOWN = 12000;     // flexed: 30s→12s — faster cycling
+// === RISK MANAGEMENT ===
+const STOP_LOSS_PERCENT = 25;         // Sell if down 25%
+const TAKE_PROFIT_PERCENT = 100;      // Sell if up 100% (2x)
+const TRAILING_STOP_PERCENT = 15;     // Trail 15% below peak price
+const MAX_POSITION_SIZE_SOL = 0.02;   // Max SOL per trade
+const MAX_POSITIONS = 3;              // Max concurrent positions
+const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
+const SCAN_INTERVAL = 30000;          // Scan for new tokens every 30s
+const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
+const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
+const MIN_TRADE_COOLDOWN = 120000;    // Wait 2 min between buys (avoid churn)
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL  = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL   = 'https://quote-api.jup.ag/v6/swap';
-const JUPITER_TIMEOUT_MS = 8000;
+const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
+const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
 
 // === PUMP.FUN BONDING CURVE CONSTANTS ===
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 const TOKEN_SPL_PROGRAM  = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-const PUMP_BUY_DISCRIMINATOR  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
-const PUMP_SELL_DISCRIMINATOR = Buffer.from([ 51,230,133,164,  1,127,131,173]);  // anchor hash for pump.fun sell
-
-// ═══════════════════════════════════════════════════════════════
-// === SNIPE MODE ===
-// ═══════════════════════════════════════════════════════════════
-const SNIPE_MODE              = true;   // buy on every new launch — no quant gate
-const SNIPE_SIZE_SOL          = 0.05;   // flat SOL per snipe entry
-const SNIPE_MAX_CONCURRENT    = 1;      // slow: one snipe at a time
-const SNIPE_LAUNCH_DELAY_MS   = 1000;   // slow: wait 1s after detection (lets BC propagate)
-const SNIPE_BYPASS_QUANT      = true;   // skip quant scoring — speed > signal quality for snipes
-const SNIPE_GRAD_ENABLED      = true;   // snipe graduation events (BC complete → Raydium)
-const SNIPE_GRAD_SLIPPAGE_BPS = 2500;   // 25% slippage for graduation buys (thin Raydium books)
-const SNIPE_GRAD_SIZE_SOL     = 0.06;   // slightly bigger on graduation (more predictable entry)
-const SNIPE_GRAD_DELAY_MS     = 2500;   // wait 2.5s for Raydium pool init after graduation
-const snipeStats  = { launches: 0, grads: 0, ok: 0, fail: 0 };
-const _snipeActive = new Set(); // mints currently in snipe flight (dedup)
-const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
+const PUMP_BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 
 // === TOP KOL WALLETS TO COPY (Verified April 2026 - MadeOnSol data) ===
 // Source: https://madeonsol.com/blog/top-solana-kol-wallets-to-copy-trade
@@ -191,176 +171,82 @@ function patternWinRate(dim, key) {
 // === QUANTIFICATION ENGINE — score every signal 0-100 ===
 // ══════════════════════════════════════════════════════════════
 function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
-  const factors = {};
+  let score = 0;
   const reasons = [];
 
-  // — KOL factor (0.0–1.0) —
-  if (kolWallets?.length > 0) {
+  // — KOL component (0-40 pts) —
+  if (kolWallets && kolWallets.length > 0) {
     let totalWr = 0, n = 0;
     for (const w of kolWallets) {
       const s = kolScores.get(w);
-      totalWr += (s && s.trades >= 2) ? s.wins / s.trades : 0.5;
-      n++;
+      if (s && s.trades >= 2) { totalWr += s.wins / s.trades; n++; }
+      else totalWr += 0.5, n++;
     }
-    factors.kol = n ? totalWr / n : 0.5;
-    reasons.push(`KOL(${(factors.kol*100).toFixed(0)}%)`);
+    const avgWr = n ? totalWr / n : 0.5;
+    const kolPts = Math.round(avgWr * 40);
+    score += kolPts;
+    reasons.push(`KOL(${(avgWr * 100).toFixed(0)}%→${kolPts}pts)`);
   } else {
-    factors.kol = 0.56; // scanner neutral — slight positive bias
-    reasons.push('KOL(neutral)');
+    score += 20; // neutral for scanner-initiated
+    reasons.push('KOL(neutral→20pts)');
   }
 
-  // — Age factor (0.15–1.0) — freshness = momentum potential
+  // — Age component (0-20 pts) — freshest tokens = most momentum upside
   if (tokenInfo?.createdAt) {
-    const ageH = (Date.now()/1000 - tokenInfo.createdAt) / 3600;
-    factors.age = ageH < 0.5 ? 1.00
-                : ageH < 1   ? 0.95
-                : ageH < 2   ? 0.85
-                : ageH < 4   ? 0.70
-                : ageH < 8   ? 0.50
-                : ageH < 24  ? 0.32
-                :              0.15;
-    reasons.push(`age(${ageH.toFixed(1)}h→${(factors.age*100).toFixed(0)}%)`);
-  } else {
-    factors.age = 0.42; // unknown age — moderate
+    const ageH = (Date.now() / 1000 - tokenInfo.createdAt) / 3600;
+    let agePts = ageH < 1 ? 20 : ageH < 2 ? 17 : ageH < 4 ? 13 : ageH < 8 ? 8 : 3;
+    score += agePts;
+    reasons.push(`age(${ageH.toFixed(1)}h→${agePts}pts)`);
   }
 
-  // — Momentum factor (0.05–1.0) — primary conviction signal
-  const m5  = tokenInfo?.priceChange5mPercent || 0;
-  const m1h = tokenInfo?.priceChange1hPercent || 0;
-  if      (m5 >= 20 && m1h >= 30) factors.momentum = 1.00;
-  else if (m5 >= 10 && m1h >= 15) factors.momentum = 0.88;
-  else if (m5 >= 5  && m1h >= 8)  factors.momentum = 0.74;
-  else if (m5 >= 2  && m1h >= 3)  factors.momentum = 0.58;
-  else if (m5 >= 0  && m1h >= 0)  factors.momentum = 0.42;
-  else if (m5 >= -3 && m1h >= -5) factors.momentum = 0.28; // slight drift
-  else if (m5 < -5  || m1h < -10) factors.momentum = 0.07; // collapsing
-  else                             factors.momentum = 0.18;
-  reasons.push(`momentum(5m=${m5.toFixed(1)}%,1h=${m1h.toFixed(1)}%→${(factors.momentum*100).toFixed(0)}%)`);
-
-  // — Volume/Liquidity factor (0.10–1.0) — turnover = genuine interest
-  if (tokenInfo?.v24hUSD && tokenInfo?.liquidity > 0) {
+  // — Volume/Liquidity turnover (0-15 pts) —
+  if (tokenInfo?.v24hUSD && tokenInfo?.liquidity) {
     const ratio = tokenInfo.v24hUSD / tokenInfo.liquidity;
-    factors.vl = ratio >= 8   ? 1.00
-               : ratio >= 5   ? 0.90
-               : ratio >= 3   ? 0.76
-               : ratio >= 1.5 ? 0.60
-               : ratio >= 0.5 ? 0.44
-               :                0.18;
-  } else {
-    factors.vl = tokenInfo?.v24hUSD > 0 ? 0.44 : 0.28;
+    let vlPts = ratio >= 5 ? 15 : ratio >= 3 ? 12 : ratio >= 1.5 ? 8 : ratio >= 1 ? 5 : 2;
+    score += vlPts;
+    reasons.push(`V/L(${ratio.toFixed(1)}→${vlPts}pts)`);
   }
-  if (tokenInfo?.v24hUSD) reasons.push(`V/L(${(factors.vl*100).toFixed(0)}%)`);
 
-  // — Pattern learning factor (0.20–0.85) — self-calibrating from trade history
-  let patternFactor = 0.50;
+  // — Volume size (0-10 pts) —
+  if (tokenInfo?.v24hUSD) {
+    const vol = tokenInfo.v24hUSD;
+    let volPts = vol > 500000 ? 10 : vol > 200000 ? 8 : vol > 100000 ? 6 : vol > 50000 ? 4 : 2;
+    score += volPts;
+    reasons.push(`vol($${(vol/1000).toFixed(0)}K→${volPts}pts)`);
+  }
+
+  // — Pattern learning bonus (0-15 pts) — from historical win rates
   if (tokenInfo) {
-    const ageH  = tokenInfo.createdAt ? (Date.now()/1000 - tokenInfo.createdAt)/3600 : null;
+    const ageH = tokenInfo.createdAt ? (Date.now()/1000 - tokenInfo.createdAt)/3600 : null;
     const ratio = (tokenInfo.v24hUSD && tokenInfo.liquidity) ? tokenInfo.v24hUSD / tokenInfo.liquidity : null;
     const hour  = new Date().getHours();
+    const ab = ageH  != null ? ageBracket(ageH)     : null;
+    const vb = ratio != null ? volLiqBracket(ratio)  : null;
     const wr = [
-      ageH  != null ? patternWinRate('byAgeBracket',    ageBracket(ageH))    : null,
-      ratio != null ? patternWinRate('byVolLiqBracket', volLiqBracket(ratio)): null,
-      patternWinRate('byHourOfDay', hour.toString()),
-      patternWinRate('bySource',    source),
+      ab ? patternWinRate('byAgeBracket',    ab)    : null,
+      vb ? patternWinRate('byVolLiqBracket', vb)    : null,
+      patternWinRate('byHourOfDay',  hour.toString()),
+      patternWinRate('bySource',     source),
     ].filter(x => x !== null);
-    if (wr.length) patternFactor = wr.reduce((a, b) => a + b, 0) / wr.length;
+    if (wr.length) {
+      const avgWr = wr.reduce((a, b) => a + b, 0) / wr.length;
+      const patPts = Math.round((avgWr - 0.5) * 30); // -15 to +15
+      score += patPts;
+      reasons.push(`pattern(${(avgWr*100).toFixed(0)}%→${patPts}pts)`);
+    }
   }
-  factors.pattern = Math.max(0.20, Math.min(0.85, patternFactor));
-  reasons.push(`pattern(${(factors.pattern*100).toFixed(0)}%)`);
 
-  // ═══════════════════════════════════════════════════════════
-  // ⛛  QUANTUM ENTANGLEMENT — Geometric coherence model
-  // Factors multiply together via weighted geometric mean.
-  // When all signals align, coherence compounds exponentially.
-  // Any collapsing dimension drags the whole score down.
-  // Momentum carries 35% weight (Profit Hunter bias); KOL 25%.
-  // ═══════════════════════════════════════════════════════════
-  const weights = { kol: 0.25, age: 0.18, momentum: 0.35, vl: 0.17, pattern: 0.05 };
-  let logSum = 0;
-  for (const [k, w] of Object.entries(weights)) {
-    logSum += w * Math.log(Math.max(0.01, factors[k]));
-  }
-  const coherence = Math.exp(logSum); // 0.0–1.0
+  score = Math.max(0, Math.min(100, score));
 
-  const score = Math.round(coherence * 100);
-
-  // Assertive conviction thresholds — no half-measures
+  // Determine position multiplier
   let multiplier, action;
-  if      (coherence >= 0.55) { multiplier = 2.8; action = 'FULL+'; } // flexed: 62%→55%, 2.0×→2.8×
-  else if (coherence >= 0.35) { multiplier = 1.7; action = 'FULL';  } // flexed: 45%→35%, 1.2×→1.7×
-  else if (coherence >= 0.18) { multiplier = 0.9; action = 'HALF';  } // flexed: 28%→18%, 0.6×→0.9×
-  else                        { multiplier = 0;   action = 'SKIP';  } // weak coherence = hard skip
+  if (score >= 70)      { multiplier = 1.3; action = 'FULL+'; }
+  else if (score >= 50) { multiplier = 1.0; action = 'FULL';  }
+  else if (score >= 30) { multiplier = 0.7; action = 'HALF';  }
+  else                  { multiplier = 0;   action = 'SKIP';  }
 
-  console.log(`   ⛛  QUANTUM COHERENCE: ${(coherence*100).toFixed(1)}% [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
+  console.log(`   📐 QUANT SCORE: ${score}/100 [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
   return { score, multiplier, action };
-}
-
-// === AI SIGNAL ANALYSIS (Groq — free tier, OpenAI-compatible; activates when GROQ_API_KEY is set) ===
-async function aiAnalyzeSignal(tokenInfo, source) {
-  if (!GROQ_KEY || !tokenInfo) return { boost: 0, verdict: 'no-ai' };
-  try {
-    const ageH   = tokenInfo.createdAt ? ((Date.now()/1000 - tokenInfo.createdAt)/3600).toFixed(1) : '?';
-    const liq    = (tokenInfo.liquidity || 0).toLocaleString();
-    const vol    = (tokenInfo.v24hUSD   || 0).toLocaleString();
-    const mcap   = (tokenInfo.marketCap || 0).toLocaleString();
-    const chg5m  = tokenInfo.priceChange5mPercent?.toFixed(2)  || '?';
-    const chg1h  = tokenInfo.priceChange1hPercent?.toFixed(2)  || '?';
-    const chg24h = tokenInfo.priceChange24hPercent?.toFixed(2) || '?';
-    const vlR    = tokenInfo.liquidity ? (tokenInfo.v24hUSD/tokenInfo.liquidity).toFixed(2) : '?';
-    const recentTrades = tradeHistory.slice(-10);
-    const wins   = recentTrades.filter(t => t.pnlPercent > 0).length;
-    const winR   = recentTrades.length ? Math.round(wins/recentTrades.length*100) : '?';
-    const streak = profitHunterState.consecutiveWins;
-
-    const prompt = [
-      `You are a world-class Solana memecoin alpha hunter. Mission: find the next 10x in the next 30 minutes. You operate at planetary scale — precision and boldness both matter.`,
-      ``,
-      `TOKEN SIGNAL (source: ${source})`,
-      `  Symbol : ${tokenInfo.symbol || 'unknown'}`,
-      `  Age    : ${ageH}h | Liq: $${liq} | Vol24h: $${vol} | MCap: $${mcap}`,
-      `  V/L    : ${vlR} | 5m: ${chg5m}% | 1h: ${chg1h}% | 24h: ${chg24h}%`,
-      ``,
-      `PORTFOLIO CONTEXT`,
-      `  Balance: ${portfolio.balance.toFixed(3)} SOL | Win rate (last 10): ${winR}% | Win streak: ${streak}`,
-      ``,
-      `RULES`,
-      `  boost +15 to +35: strong early alpha (fresh, pumping, thin float, high momentum)`,
-      `  boost +1 to +14: positive lean but not conviction`,
-      `  boost 0: neutral`,
-      `  boost -1 to -10: red flags (age>12h, declining, low vol, likely rug)`,
-      `  BUY = deploy capital now. SKIP = hard pass. HOLD = marginal, pass for now.`,
-      ``,
-      `Return JSON only (no markdown): { "boost": <integer -10 to 35>, "verdict": "<BUY|SKIP|HOLD>", "reason": "<6 words max>" }`,
-    ].join('\n');
-
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_KEY}` },
-      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: prompt }], max_tokens: 100, temperature: 0.1 }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) {
-      const errMsg = data.error?.message || data.error || `HTTP ${res.status}`;
-      console.log(`   ❌ Groq API error: ${errMsg}`);
-      return { boost: 0, verdict: 'api-error' };
-    }
-    const text = data.choices?.[0]?.message?.content?.trim();
-    if (!text) {
-      console.log(`   ⚠️  Groq empty response (choices=${JSON.stringify(data.choices?.length)})`);
-      return { boost: 0, verdict: 'empty' };
-    }
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-    if (!parsed.verdict) {
-      console.log(`   ⚠️  AI parse failed, raw: ${text.slice(0, 80)}`);
-      return { boost: 0, verdict: 'parse-error' };
-    }
-    const boost = Math.max(-10, Math.min(35, parsed.boost || 0));  // −10→+35 range
-    console.log(`   🤖 AI VERDICT: ${parsed.verdict} | boost${boost >= 0 ? '+' : ''}${boost} | ${parsed.reason}`);
-    return { boost, verdict: parsed.verdict, reason: parsed.reason };
-  } catch (e) {
-    console.log(`   ⚠️  AI analysis skipped: ${e.message}`);
-    return { boost: 0, verdict: 'error' };
-  }
 }
 
 // === STATE ===
@@ -371,109 +257,11 @@ const safetyState = {
   dailyStartTime: Date.now(),
   haltedUntil: 0,         // timestamp — circuit breaker
   tradesHalted: false,
-  // Capital protection
-  consecutiveLosses: 0,   // streak counter
-  dailyTradeCount: 0,     // buys placed today
-  softSizeMultiplier: 1.0,// 0.4–1.0 progressive loss reduction
 };
 const positions = new Map(); // tokenMint -> { entryPrice, highestPrice, amount, entryTime, symbol }
-
-// === ROUTE ENGINE TELEMETRY ===
-const routeStats = {
-  pumpFunDirect: { ok: 0, fail: 0 },
-  jupiterSwap:   { ok: 0, fail: 0 },
-  exhausted:     0,
-};
-function logRouteStats() {
-  const pf = routeStats.pumpFunDirect;
-  const jp = routeStats.jupiterSwap;
-  console.log(`   📊 ROUTE STATS | pump.fun: ${pf.ok}✅ ${pf.fail}❌ | Jupiter: ${jp.ok}✅ ${jp.fail}❌ | exhausted: ${routeStats.exhausted} | snipes: ${snipeStats.ok}✅/${snipeStats.launches}L ${snipeStats.grads}G`);
-}
-
-// === BONDING CURVE CACHE ===
-// Avoids duplicate RPC getAccountInfo calls for same mint within 90s
-const bcCache = new Map(); // mint → { hasBondingCurve, bcComplete, ts }
-const BC_CACHE_TTL_MS = 90_000;
-async function getBondingCurveInfo(connection, tokenMint) {
-  const cached = bcCache.get(tokenMint);
-  if (cached && Date.now() - cached.ts < BC_CACHE_TTL_MS) return cached;
-  try {
-    const mint = new PublicKey(tokenMint);
-    const [bondingCurveAddr] = PublicKey.findProgramAddressSync(
-      [Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM
-    );
-    let bcInfo = await connection.getAccountInfo(bondingCurveAddr);
-    // Retry up to 3x (80ms each) — fresh launch accounts take time to propagate to RPC
-    if (!bcInfo) {
-      for (let _r = 0; _r < 3; _r++) {
-        await new Promise(_res => setTimeout(_res, 80));
-        bcInfo = await connection.getAccountInfo(bondingCurveAddr);
-        if (bcInfo) { console.log(`   🔄 BC account found on retry ${_r+1}`); break; }
-      }
-    }
-    const result = {
-      hasBondingCurve: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)),
-      bcComplete: !!(bcInfo && bcInfo.owner.equals(PUMP_PROGRAM) && bcInfo.data[48] === 1),
-      bcInfo: (bcInfo && bcInfo.owner.equals(PUMP_PROGRAM)) ? bcInfo : null,
-      ts: Date.now(),
-    };
-    bcCache.set(tokenMint, result);
-    return result;
-  } catch {
-    return { hasBondingCurve: false, bcComplete: false, bcInfo: null, ts: Date.now() };
-  }
-}
-
-// === PUMP.FUN STATIC ACCOUNT CACHES ===
-// globalInfo: rarely changes (fee recipient slot), 5 min TTL
-// mintInfo: tokenProgram ownership never changes, permanent cache
-// ataInfo: ATA existence — once created stays forever, 60s TTL
-let _globalInfoCache = null;
-let _globalInfoTs = 0;
-const GLOBAL_CACHE_TTL_MS = 300_000; // 5 min
-const mintProgCache = new Map(); // mintPubkeyStr → PublicKey (token program)
-const ataExistsCache = new Map(); // ataStr → { exists, ts }
-const ATA_CACHE_TTL_MS = 60_000;
-
-async function getCachedGlobalInfo(connection, globalPDA) {
-  if (_globalInfoCache && Date.now() - _globalInfoTs < GLOBAL_CACHE_TTL_MS) return _globalInfoCache;
-  try {
-    _globalInfoCache = await connection.getAccountInfo(globalPDA);
-    _globalInfoTs = Date.now();
-    return _globalInfoCache;
-  } catch { return _globalInfoCache; } // use stale on error
-}
-
-async function getCachedTokenProg(connection, mint) {
-  const k = mint.toBase58();
-  if (mintProgCache.has(k)) return mintProgCache.get(k);
-  try {
-    const mintInfo = await connection.getAccountInfo(mint);
-    const prog = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
-    mintProgCache.set(k, prog);
-    return prog;
-  } catch { return TOKEN_SPL_PROGRAM; }
-}
-
-async function getCachedAtaExists(connection, ataKey) {
-  const k = ataKey.toBase58();
-  const cached = ataExistsCache.get(k);
-  if (cached && Date.now() - cached.ts < ATA_CACHE_TTL_MS) return cached.exists;
-  try {
-    const info = await connection.getAccountInfo(ataKey);
-    const exists = !!info;
-    ataExistsCache.set(k, { exists, ts: Date.now() });
-    return exists;
-  } catch { return false; }
-}
-const profitHunterState = {
-  consecutiveWins: 0,      // reset on any loss
-  reEntryAllowed: new Set(), // tokens closed at TP — may re-enter
-};
 const tradeHistory = [];
 const seenSignatures = new Set();
 let lastBuyTime = 0; // Cooldown tracker
-let currentAction = null; // Confidence action for active buy ('FULL+','FULL','HALF')
 
 // === CONSENSUS TRACKING ===
 // Track KOL buy signals: tokenMint -> { wallets: Set, firstSeen: timestamp }
@@ -488,51 +276,12 @@ const candidateKols = new Map(); // wallet -> { hits, seenTokens }
 // === SAFETY CAPITAL SCALE ENGINE ===
 // ══════════════════════════════════════════════════════════════
 // Position size = balance × BASE_RISK_PCT, capped at hard limits
-const BASE_RISK_PCT    = 0.28;   // flexed: 15%→28% of balance per trade
+const BASE_RISK_PCT    = 0.08;   // 8% of balance per trade (default)
 const MIN_POSITION_SOL = 0.008;  // Never trade less than this
-const MAX_POSITION_SOL = 0.25;   // raised: allows 50% cap to express on balances up to 0.5 SOL
+const MAX_POSITION_SOL = 0.05;   // Hard cap regardless of balance
 const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
 const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
 const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
-
-// --- CAPITAL PROTECTION ---
-const ABSOLUTE_FLOOR_SOL       = 0.04;   // Never trade if balance drops below this
-const MAX_DAILY_TRADES         = 35;     // 20→35 hard cap on buys per day
-const MAX_CONSECUTIVE_LOSSES   = 3;      // Pause 1h after N straight losses
-const MAX_CONSECUTIVE_LOSSES_HARD = 5;  // Pause 4h after N straight losses
-const STREAK_PAUSE_MS          = 1 * 60 * 60 * 1000;  // 1h streak pause
-const STREAK_PAUSE_HARD_MS     = 4 * 60 * 60 * 1000;  // 4h hard streak pause
-// Soft daily loss tiers — progressive size reduction before halt
-const SOFT_LOSS_TIER1          = 0.07;   // At  7% daily loss → 70% position size
-const SOFT_LOSS_TIER2          = 0.11;   // At 11% daily loss → 40% position size
-
-// --- FULL SCALING ---
-const KELLY_LOOKBACK_TRADES    = 25;     // Trades to use for Kelly Criterion
-const KELLY_FRACTION           = 0.70;   // flexed: 50%→70% fractional Kelly
-
-// Confidence-tiered balance caps — how much of balance each conviction level may use
-const CONFIDENCE_BALANCE_CAP = {
-  'FULL+': 0.50,  // ≥55% coherence → up to 50% of balance
-  'FULL':  0.35,  // ≥35% coherence → up to 35% of balance
-  'HALF':  0.20,  // ≥18% coherence → up to 20% of balance
-};
-const STREAK_SCALE_PCT         = 0.15;   // ±15% per win/loss streak tier
-const VOL_HIGH_THRESHOLD       = 50;     // >50% 1h change → reduce size 25%
-const VOL_LOW_THRESHOLD        = 10;     // <10% 1h change → bonus +10% size
-// Tiered take-profit (partial sells)
-const TP_TIER1_PCT             = 50;     // 75%→50% — take chips faster
-const TP_TIER2_PCT             = 100;    // 125%→100% — de-risk while letting tail run
-
-// ─── PROFIT HUNTER MODE ───────────────────────────────────────
-const PROFIT_HUNTER_MODE       = true;
-const PH_FAST_STOP_PCT         = 25;    // Exit at −25% if still in first 4 min (tightened from −15%/5min, relaxed from −20%/2min)
-const PH_FAST_STOP_WINDOW_MS   = 4 * 60 * 1000;  // 4-min window for fast stop
-const PH_RUN_THRESHOLD_PCT     = 60;    // Above +60% PnL → skip max-hold eviction (let it run)
-const PH_MOMENTUM_5M_MIN       = 3;     // 5%→3% — catch momentum earlier
-const PH_MOMENTUM_1H_MIN       = 7;     // 10%→7% — wider trend confirmation
-const PH_MOMENTUM_SIZE_BOOST   = 1.60;  // 1.4%→1.6× size on confirmed momentum
-const PH_STREAK_THRESHOLD      = 3;     // 3+ consecutive wins → streak bonus
-const PH_STREAK_CAP_BOOST      = 1.25;  // +25% position cap during streak
 
 function resetDailyCounterIfNeeded() {
   const elapsed = Date.now() - safetyState.dailyStartTime;
@@ -544,86 +293,32 @@ function resetDailyCounterIfNeeded() {
   }
 }
 
-// --- Kelly Criterion helper ---
-function computeKellyMultiplier() {
-  if (tradeHistory.length < 5) return 1.0; // not enough data
-  const recent = tradeHistory.slice(-KELLY_LOOKBACK_TRADES);
-  const wins = recent.filter(t => t.pnlPercent > 0);
-  const losses = recent.filter(t => t.pnlPercent <= 0);
-  if (!wins.length || !losses.length) return wins.length > losses.length ? 1.2 : 0.8;
-  const W = wins.length / recent.length;
-  const avgWin  = wins.reduce((a, t) => a + t.pnlPercent, 0) / wins.length / 100;
-  const avgLoss = Math.abs(losses.reduce((a, t) => a + t.pnlPercent, 0) / losses.length / 100);
-  if (avgLoss === 0) return 1.2;
-  const R = avgWin / avgLoss;
-  const kellyFull = W - (1 - W) / R;
-  const kellyFrac = kellyFull * KELLY_FRACTION;
-  // Translate Kelly fraction into a ±multiplier: Kelly of 12% base → 1.0
-  const mult = Math.max(0.5, Math.min(1.6, 1 + (kellyFrac - BASE_RISK_PCT) / BASE_RISK_PCT));
-  console.log(`   📐 Kelly: W=${(W*100).toFixed(0)}% R=${R.toFixed(2)} frac=${(kellyFrac*100).toFixed(1)}% → mult=${mult.toFixed(2)}`);
-  return mult;
-}
-
-// --- Streak multiplier helper ---
-function computeStreakMultiplier() {
-  const losses = safetyState.consecutiveLosses;
-  if (losses >= 2) return Math.max(0.6, 1 - STREAK_SCALE_PCT * losses);
-  // Check recent wins
-  const recentFew = tradeHistory.slice(-3);
-  const winStreak = recentFew.length >= 2 && recentFew.every(t => t.pnlPercent > 0) ? recentFew.length : 0;
-  if (winStreak >= 3) return 1 + STREAK_SCALE_PCT * 2;  // +30%
-  if (winStreak >= 2) return 1 + STREAK_SCALE_PCT;       // +15%
-  return 1.0;
-}
-
-function getScaledPositionSize(quantMultiplier = 1.0, tokenInfo = null, action = null) {
+function getScaledPositionSize(quantMultiplier = 1.0) {
   resetDailyCounterIfNeeded();
 
   const bal = portfolio.balance;
   if (bal <= 0) return 0;
 
-  // 1. Kelly Criterion base
-  const kellyMul   = computeKellyMultiplier();
-  // 2. Win/loss streak
-  const streakMul  = computeStreakMultiplier();
-  // 3. Soft daily loss reduction
-  const softMul    = safetyState.softSizeMultiplier;
-  // 4. Volatility adjustment
-  let volMul = 1.0;
-  if (tokenInfo?.priceChange1hPercent != null) {
-    const chg1h = Math.abs(tokenInfo.priceChange1hPercent);
-    if (chg1h > VOL_HIGH_THRESHOLD) { volMul = 0.75; }
-    else if (chg1h < VOL_LOW_THRESHOLD) { volMul = 1.10; }
-  }
+  // Base size: 8% of current balance, scaled by quant signal quality
+  let size = bal * BASE_RISK_PCT * quantMultiplier;
 
-  // Base × all multipliers
-  let size = bal * BASE_RISK_PCT * quantMultiplier * kellyMul * streakMul * softMul * volMul;
-  console.log(`   📊 SIZE BUILD: base=${(bal*BASE_RISK_PCT).toFixed(4)} Kelly×${kellyMul.toFixed(2)} streak×${streakMul.toFixed(2)} soft×${softMul.toFixed(2)} vol×${volMul.toFixed(2)} quant×${quantMultiplier.toFixed(2)} → ${size.toFixed(4)} SOL`);
-
-  // Conservative mode: balance < 85% of start → hard clamp
-  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.75) {
-    size = Math.min(size, bal * 0.12 * quantMultiplier);
-    console.log(`   🛡️  CONSERVATIVE MODE (balance -15% from start) → capped`);
-  }
-
-  // Profit protect: balance > 200% of start → cap exposure
-  if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 2.0) {
-    size = Math.min(size, bal * 0.05 * quantMultiplier);
-    console.log(`   📈  PROFIT PROTECT (2× start) → capped at 5%`);
-  }
-
-  // Confidence-based balance ceiling (primary user rule)
-  const confCap = action ? (CONFIDENCE_BALANCE_CAP[action] ?? 0.20) : 0.50;
-  const confCeil = bal * confCap;
-  if (size > confCeil) {
-    console.log(`   🎯 CONFIDENCE CAP [${action||'default'}]: ${size.toFixed(4)} → ${confCeil.toFixed(4)} SOL (${(confCap*100).toFixed(0)}% bal)`);
-    size = confCeil;
-  }
-
-  // Hard bounds
+  // Apply hard bounds
   size = Math.max(MIN_POSITION_SOL, Math.min(MAX_POSITION_SOL, size));
 
-  // Reserve guard
+  // Conservative mode: if portfolio shrank from start, reduce to 6%
+  if (portfolio.startingBalance > 0 && bal < portfolio.startingBalance * 0.85) {
+    size = bal * 0.06 * quantMultiplier;
+    size = Math.max(MIN_POSITION_SOL, Math.min(size, MAX_POSITION_SOL * 0.6));
+    console.log(`   🛡️  CONSERVATIVE MODE: balance down from start → ${size.toFixed(4)} SOL`);
+  }
+
+  // Profit mode: if up >50% from start, take slightly smaller risk (protect gains)
+  if (portfolio.startingBalance > 0 && bal > portfolio.startingBalance * 1.5) {
+    size = Math.min(size, bal * 0.05 * quantMultiplier);
+    console.log(`   📈  PROFIT PROTECT: portfolio up 50%+ → capping position at ${size.toFixed(4)} SOL`);
+  }
+
+  // Reserve guard: never risk more than (balance - reserve - other open positions)
   const inPositions = positions.size * (bal / Math.max(positions.size + 1, 1));
   const free = bal - MIN_BALANCE_RESERVE - inPositions;
   if (size > free * 0.5) size = Math.max(MIN_POSITION_SOL, free * 0.5);
@@ -638,7 +333,6 @@ function checkSafetyGates() {
   if (safetyState.haltedUntil > 0 && Date.now() > safetyState.haltedUntil) {
     safetyState.haltedUntil = 0;
     safetyState.tradesHalted = false;
-    safetyState.consecutiveLosses = 0; // reset streak after cooldown
     console.log('✅ SAFETY: Circuit-breaker cooldown over — trading resumed');
   }
   if (safetyState.tradesHalted) {
@@ -647,56 +341,22 @@ function checkSafetyGates() {
     return false;
   }
 
-  // 2. Absolute capital floor — never trade below this SOL balance
-  if (portfolio.balance <= ABSOLUTE_FLOOR_SOL) {
-    console.log(`   🔴 CAPITAL FLOOR: balance ${portfolio.balance.toFixed(4)} SOL ≤ floor ${ABSOLUTE_FLOOR_SOL} SOL — trading suspended`);
-    return false;
-  }
-
-  // 3. Daily trade cap
-  if (safetyState.dailyTradeCount >= MAX_DAILY_TRADES) {
-    console.log(`   🔴 DAILY TRADE CAP: ${safetyState.dailyTradeCount}/${MAX_DAILY_TRADES} trades today — resuming tomorrow`);
-    return false;
-  }
-
-  // 4. Consecutive loss streak breaker
-  if (safetyState.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES_HARD) {
-    console.log(`   🚨 HARD STREAK BREAKER: ${safetyState.consecutiveLosses} consecutive losses — pausing 4h`);
-    safetyState.tradesHalted = true;
-    safetyState.haltedUntil = Date.now() + STREAK_PAUSE_HARD_MS;
-    return false;
-  }
-  if (safetyState.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
-    console.log(`   ⚠️  SOFT STREAK BREAKER: ${safetyState.consecutiveLosses} consecutive losses — pausing 1h`);
-    safetyState.tradesHalted = true;
-    safetyState.haltedUntil = Date.now() + STREAK_PAUSE_MS;
-    return false;
-  }
-
-  // 5. Soft daily loss tiers — progressive position size reduction
+  // 2. Daily loss limit
   if (safetyState.dailyStartBalance > 0) {
     const dailyLoss = (safetyState.dailyStartBalance - portfolio.balance) / safetyState.dailyStartBalance;
     if (dailyLoss >= DAILY_LOSS_LIMIT) {
-      console.log(`   🚨 DAILY LOSS LIMIT (${(dailyLoss*100).toFixed(1)}% ≥ ${DAILY_LOSS_LIMIT*100}%) — halting 3h`);
+      console.log(`   🚨 DAILY LOSS LIMIT (${(dailyLoss*100).toFixed(1)}% ≥ ${DAILY_LOSS_LIMIT*100}%) — halting for 3h`);
       safetyState.tradesHalted = true;
       safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
       return false;
-    } else if (dailyLoss >= SOFT_LOSS_TIER2) {
-      safetyState.softSizeMultiplier = 0.40;
-      console.log(`   🟡 SOFT PROTECT T2: daily loss ${(dailyLoss*100).toFixed(1)}% → positions at 40%`);
-    } else if (dailyLoss >= SOFT_LOSS_TIER1) {
-      safetyState.softSizeMultiplier = 0.70;
-      console.log(`   🟡 SOFT PROTECT T1: daily loss ${(dailyLoss*100).toFixed(1)}% → positions at 70%`);
-    } else {
-      safetyState.softSizeMultiplier = 1.0; // full size
     }
   }
 
-  // 6. Drawdown circuit-breaker
+  // 3. Drawdown circuit-breaker
   if (portfolio.startingBalance > 0) {
     const drawdown = (portfolio.startingBalance - portfolio.balance) / portfolio.startingBalance;
     if (drawdown >= DRAWDOWN_LIMIT) {
-      console.log(`   🚨 DRAWDOWN LIMIT (${(drawdown*100).toFixed(1)}% ≥ ${DRAWDOWN_LIMIT*100}%) — halting 3h`);
+      console.log(`   🚨 DRAWDOWN LIMIT (${(drawdown*100).toFixed(1)}% ≥ ${DRAWDOWN_LIMIT*100}%) — halting for 3h`);
       safetyState.tradesHalted = true;
       safetyState.haltedUntil = Date.now() + HALT_DURATION_MS;
       return false;
@@ -706,30 +366,9 @@ function checkSafetyGates() {
   return true;
 }
 
-function recordTradeForSafety(pnlSol, pnlPercent = null) {
+function recordTradeForSafety(pnlSol) {
   safetyState.dailyPnl += pnlSol;
   if (safetyState.dailyStartBalance === 0) safetyState.dailyStartBalance = portfolio.balance;
-  // Consecutive loss/win tracking (safety + profit hunter)
-  if (pnlPercent !== null) {
-    if (pnlPercent < 0) {
-      safetyState.consecutiveLosses++;
-      profitHunterState.consecutiveWins = 0;
-      console.log(`   📉 Consecutive losses: ${safetyState.consecutiveLosses}`);
-    } else {
-      safetyState.consecutiveLosses = 0; // reset on any win
-      if (PROFIT_HUNTER_MODE) {
-        profitHunterState.consecutiveWins++;
-        if (profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD) {
-          console.log(`   🔥 PROFIT HUNTER WIN STREAK: ${profitHunterState.consecutiveWins} in a row!`);
-        }
-      }
-    }
-  }
-}
-
-function recordBuyForSafety() {
-  safetyState.dailyTradeCount++;
-  console.log(`   📊 Daily trade count: ${safetyState.dailyTradeCount}/${MAX_DAILY_TRADES}`);
 }
 
 function getKolScore(wallet) {
@@ -743,9 +382,9 @@ function getDynamicPositionSize(triggeringWallets) {
   for (const w of triggeringWallets) { total += getKolScore(w); n++; }
   const avgScore = n ? total / n : 0.5;
   // Low-confidence KOL (score<0.4) → 0.5× size; high-confidence (>0.7) → 1.3× size
-  const multiplier = Math.max(0.5, Math.min(2.0, avgScore * 2.4));  // flexed: cap 1.3→2.0
+  const multiplier = Math.max(0.5, Math.min(1.3, avgScore * 1.6));
   const size = MAX_POSITION_SIZE_SOL * multiplier;
-  return Math.min(size, portfolio.balance * 0.32); // flexed: never >32% of balance
+  return Math.min(size, portfolio.balance * 0.2); // never >20% of balance
 }
 
 function updateKolScore(wallet, won, pnlPercent) {
@@ -808,81 +447,12 @@ if (PRIVATE_KEY) {
 }
 
 // === HELPERS ===
-// Per-domain serialized throttle — promise-chain queue.
-// OLD design used a Map timestamp: all N concurrent callers read the same lastCall,
-// computed wait=0, and fired simultaneously → Railway drops connections (fetch failed).
-// NEW design: each caller appends a gap-delay onto the tail of a per-domain promise
-// chain, then awaits the PREVIOUS tail. This serializes callers so only one
-// request per domain is in-flight at a time, spaced by gap ms.
-const _domainTails = {};
-const DOMAIN_MIN_GAP_MS = {
-  'public-api.birdeye.so': 800,
-  'api.dexscreener.com':   600,
-  'quote-api.jup.ag':      900,   // higher gap = fewer 429s under reduced concurrency
-  'mainnet.helius-rpc.com':300,
-};
-async function _domainThrottle(url) {
-  try {
-    const host = new URL(url).hostname;
-    const gap  = DOMAIN_MIN_GAP_MS[host];
-    if (!gap) return;
-    const tail = _domainTails[host] ?? Promise.resolve();
-    _domainTails[host] = tail.then(() => new Promise(r => setTimeout(r, gap)));
-    await tail; // wait for all previous callers' gaps to drain first
-  } catch {}
-}
-
-async function safeFetch(url, options = {}, _retries = 4) {
-  await _domainThrottle(url);
+async function safeFetch(url, options = {}) {
   try {
     const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
-    if (res.status === 429 && _retries > 0) {
-      const retryAfter = parseInt(res.headers.get('Retry-After') || '3', 10);
-      const attempt    = 4 - _retries;
-      const delay      = Math.min(retryAfter * 1000 * Math.pow(2, attempt), 30000);
-      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${(delay/1000).toFixed(1)}s (${_retries} retries left)`);
-      await new Promise(r => setTimeout(r, delay));
-      return safeFetch(url, options, _retries - 1);
-    }
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
-    if (_retries > 0 && (e.code === 'ECONNRESET' || e.code === 'ENOTFOUND' || e.code === 'ETIMEDOUT' || e.message?.includes('fetch failed') || e.message?.includes('terminated'))) {
-      const delay = 1500 * (5 - _retries);
-      await new Promise(r => setTimeout(r, delay));
-      return safeFetch(url, options, _retries - 1);
-    }
-    return null;
-  }
-}
-
-async function safeFetchVerbose(url, options = {}, label = '', _retries = 3) {
-  await _domainThrottle(url);
-  try {
-    const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
-    const data = await res.json().catch(() => null);
-    if (res.status === 429 && _retries > 0) {
-      const delay = 700;
-      console.log(`   ⏳ 429 [${new URL(url).hostname}] — backoff ${delay}ms (${_retries} left)`);
-      await new Promise(r => setTimeout(r, delay));
-      return safeFetchVerbose(url, options, label, _retries - 1);
-    }
-    if (!res.ok) {
-      const errMsg = data?.error?.message || data?.error || data?.message || res.statusText;
-      console.log(`   ❌ ${label || url.slice(0,60)} → HTTP ${res.status}: ${errMsg}`);
-      return null;
-    }
-    return data;
-  } catch (e) {
-    const cause = e.cause?.code || e.cause?.message || e.code || '';
-    const detail = cause ? ` [${cause}]` : '';
-    if (_retries > 0 && e.code !== 'ENOTFOUND' && (e.message?.includes('fetch failed') || e.message?.includes('terminated') || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT')) {
-      const delay = 300 * (4 - _retries);
-      console.log(`   ⏳ ${label} — retrying in ${delay}ms (${_retries} left)${detail}`);
-      await new Promise(r => setTimeout(r, delay));
-      return safeFetchVerbose(url, options, label, _retries - 1);
-    }
-    console.log(`   ❌ ${label || 'fetch'} error: ${e.message}${detail}`);
     return null;
   }
 }
@@ -943,7 +513,7 @@ async function getTokenPrice(mintAddress) {
       const kcSol = await safeFetch('https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=SOL-USDT');
       solUsd = kcSol?.data?.price ? parseFloat(kcSol.data.price) : null;
     }
-    solUsd = solUsd || 165; // Last resort hardcoded fallback (update monthly)
+    solUsd = solUsd || 85; // Last resort hardcoded fallback
     const quote = await safeFetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${mintAddress}&amount=${LAMPORTS_PER_SOL}&slippageBps=300`
     );
@@ -981,7 +551,6 @@ async function getTokenInfo(mintAddress) {
     v24hUSD:              best.volume?.h24 || 0,
     priceChange24hPercent: best.priceChange?.h24 || 0,
     priceChange1hPercent:  best.priceChange?.h1 || 0,
-    priceChange5mPercent:  best.priceChange?.m5  || 0,
     createdAt,
     marketCap:            best.marketCap || 0,
     fdv:                  best.fdv || 0,
@@ -993,42 +562,22 @@ async function getTokenInfo(mintAddress) {
 // === JUPITER SWAP ENGINE (Core live trading logic) ===
 // ══════════════════════════════════════════════════════════════
 
-async function getJupiterQuote(inputMint, outputMint, amountLamports, slippageBpsOverride = null) {
-  const slippage = slippageBpsOverride ?? SLIPPAGE_BPS;
+async function getJupiterQuote(inputMint, outputMint, amountLamports) {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
     amount: amountLamports.toString(),
-    slippageBps: slippage.toString(),
+    slippageBps: SLIPPAGE_BPS.toString(),
     onlyDirectRoutes: 'false',
     asLegacyTransaction: 'false',
   });
 
-  const quote = await safeFetchVerbose(`${JUPITER_QUOTE_URL}?${params}`, {}, `Jupiter quote (${slippage/100}%slip)`);
-  if (!quote) return null;
-  // Jupiter returns HTTP 200 but with error field when no route exists
-  if (quote.error || !quote.outAmount) {
-    console.log(`   ❌ Jupiter: no route — ${quote.error || 'outAmount missing'}`);
+  const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
+  if (!quote) {
+    console.log('   ❌ Jupiter quote failed');
     return null;
   }
   return quote;
-}
-
-// Tries Jupiter with escalating slippage — no waits, go wide fast
-async function getJupiterQuoteWithFallback(inputMint, outputMint, amountLamports) {
-  let q = await getJupiterQuote(inputMint, outputMint, amountLamports, 300);
-  if (q) return q;
-  console.log('   🔄 5% slip...');
-  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 500);
-  if (q) return q;
-  console.log('   🔄 10% slip...');
-  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 1000);
-  if (q) return q;
-  console.log('   🔄 25% slip...');
-  q = await getJupiterQuote(inputMint, outputMint, amountLamports, 2500);
-  if (q) return q;
-  console.log('   🔄 50% slip — last resort...');
-  return getJupiterQuote(inputMint, outputMint, amountLamports, 5000);
 }
 
 async function executeJupiterSwap(connection, quote) {
@@ -1037,65 +586,40 @@ async function executeJupiterSwap(connection, quote) {
     return null;
   }
 
-  // ── Fetch blockhash BEFORE building TX (must match for confirmation) ──
-  let confBlockhash, confLvbh;
-  try {
-    ({ blockhash: confBlockhash, lastValidBlockHeight: confLvbh } =
-      await connection.getLatestBlockhash('confirmed'));
-  } catch (e) {
-    console.log(`   ❌ Failed to fetch blockhash: ${e.message}`);
-    return null;
-  }
-
-  // ── Build swap TX — try primary endpoint then fallback ───────────────
-  const swapBody = JSON.stringify({
-    quoteResponse: quote,
-    userPublicKey: keypair.publicKey.toString(),
-    wrapAndUnwrapSol: true,
-    computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
-    dynamicComputeUnitLimit: true,
+  // Get swap transaction from Jupiter
+  const swapResponse = await safeFetch(JUPITER_SWAP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: keypair.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+      computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
+      dynamicComputeUnitLimit: true,
+    }),
   });
-  const swapOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: swapBody };
 
-  const swapResponse = await safeFetch(JUPITER_SWAP_URL, swapOpts);
   if (!swapResponse?.swapTransaction) {
-    console.log('   ❌ Jupiter swap TX build failed');
+    console.log('   ❌ Jupiter swap transaction build failed');
     return null;
   }
 
   try {
-    // ── Deserialize, sign, and send ──────────────────────────────────────
+    // Deserialize, sign, and send
     const txBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(txBuf);
     transaction.sign([keypair]);
 
     const signature = await connection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: true,   // speed-optimised; on-chain errors caught in confirmation
+      skipPreflight: true,
       maxRetries: 3,
     });
-    console.log(`   📡 TX sent: https://solscan.io/tx/${signature}`);
 
-    // ── Confirm using pre-fetched blockhash (no race with expiry) ────────
-    try {
-      const confirmation = await connection.confirmTransaction(
-        { signature, blockhash: confBlockhash, lastValidBlockHeight: confLvbh },
-        'confirmed'
-      );
-      if (confirmation.value.err) {
-        console.log(`   ❌ TX failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
-        return null;
-      }
-    } catch (confirmErr) {
-      console.log(`   ⚠️  Confirmation timeout (${confirmErr.message?.slice(0,60)}) — verifying...`);
-      await new Promise(r => setTimeout(r, 6000));
-      try {
-        const status = await connection.getSignatureStatus(signature);
-        if (status?.value?.err) {
-          console.log(`   ❌ TX status: failed — ${JSON.stringify(status.value.err)}`);
-          return null;
-        }
-        console.log(`   ✅ TX status: ${status?.value?.confirmationStatus || 'pending'}`);
-      } catch { /* best-effort — assume success */ }
+    // Confirm transaction
+    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    if (confirmation.value.err) {
+      console.log(`   ❌ TX failed: ${JSON.stringify(confirmation.value.err)}`);
+      return null;
     }
 
     console.log(`   ✅ TX confirmed: https://solscan.io/tx/${signature}`);
@@ -1106,153 +630,6 @@ async function executeJupiterSwap(connection, quote) {
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-// === STABLE ROUTE ENGINE v9.2 ===
-// Smart routing: bonding curve detection → right route first time
-// Priority: pump.fun direct (if active BC) → Jupiter (wide slippage) → last-resort pump.fun
-// Telemetry: routeStats tracks success/failure per route
-// ══════════════════════════════════════════════════════════════
-
-// === RUG DETECTION GATE ===
-function isLikelyRug(tokenInfo) {
-  if (!tokenInfo) return false;
-  const liq  = tokenInfo.liquidity?.usd  || tokenInfo.liquidityUsd  || 0;
-  const mcap = tokenInfo.marketCap        || tokenInfo.fdv           || 0;
-  const vol5m = tokenInfo.volume?.m5      || tokenInfo.volume5m      || 0;
-  const vol1h = tokenInfo.volume?.h1      || tokenInfo.volume1h      || 0;
-  if (mcap > 500 && liq === 0)                    return true; // pool drained / rug
-  if (mcap > 0 && mcap < 50 && vol5m === 0 && vol1h === 0) return true; // dead launch
-  return false;
-}
-
-async function routeEngine(connection, tokenMint, solAmount, symbol) {
-  const label = symbol || tokenMint.slice(0, 12);
-  const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-
-  // ─── Step 1: Bonding curve detection (cached) ───────────────────────
-  const { hasBondingCurve, bcComplete, bcInfo } = await getBondingCurveInfo(connection, tokenMint);
-  const bcStatus = hasBondingCurve ? (bcComplete ? 'graduated→DEX' : 'ACTIVE BC') : 'no BC (DEX)';
-  console.log(`   🗺️  ROUTE ENGINE | ${label} | ${solAmount.toFixed(4)} SOL | BC: ${bcStatus}`);
-
-  // ══════════════════════════════════════════════════
-  // PUMP.FUN PATH — token still on bonding curve (pre-graduation)
-  // Jupiter has NO liquidity for BC tokens — never try it here.
-  // ══════════════════════════════════════════════════
-  if (hasBondingCurve && !bcComplete) {
-    // Route A: pump.fun direct with cached layout
-    console.log(`   🎯 ROUTE A: pump.fun direct (active bonding curve)`);
-    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount, bcInfo);
-    if (pumpResult) {
-      routeStats.pumpFunDirect.ok++;
-      console.log(`   ✅ ROUTE A success`);
-      return pumpResult;
-    }
-    routeStats.pumpFunDirect.fail++;
-    console.log(`   ⚠️  ROUTE A failed — clearing BC cache, retrying with fresh detection`);
-
-    // Invalidate stale cache and retry with fresh BC detection
-    bcCache.delete(tokenMint);
-    await new Promise(r => setTimeout(r, 2000));
-    const { hasBondingCurve: hbc2, bcComplete: bc2, bcInfo: bi2 } = await getBondingCurveInfo(connection, tokenMint);
-
-    if (hbc2 && !bc2) {
-      console.log(`   🎯 ROUTE A2: pump.fun retry (fresh BC data)`);
-      const retry = await buyPumpFunDirect(connection, tokenMint, solAmount, bi2);
-      if (retry) {
-        routeStats.pumpFunDirect.ok++;
-        console.log(`   ✅ ROUTE A2 success`);
-        return retry;
-      }
-      routeStats.pumpFunDirect.fail++;
-      console.log(`   ❌ All pump.fun routes exhausted for ${label}`);
-    } else if (bc2) {
-      console.log(`   🎓 Token just graduated! Routing to Jupiter...`);
-      // fall through to Jupiter path below
-    } else {
-      // Bonding curve gone — token may not exist or already rugged
-      console.log(`   ❌ BC vanished — token may not exist yet or already rugged`);
-      routeStats.exhausted++;
-      return null;
-    }
-    // If we fell through (bc2 === graduated), proceed to Jupiter
-    if (hbc2 && !bc2) {
-      routeStats.exhausted++;
-      return null;
-    }
-  }
-
-  // ══════════════════════════════════════════════════
-  // JUPITER PATH — graduated or DEX-listed tokens only
-  // Wider slippage for newly graduated tokens (thin books).
-  // ══════════════════════════════════════════════════
-  // ROUTE C (early): when BC detection returned false, try pump.fun direct FIRST.
-  // On Railway, getAccountInfo can return null for brand-new tokens (account lag).
-  // Trying Jupiter first wastes 8s; pump.fun direct only costs ~200ms.
-  if (!hasBondingCurve) {
-    console.log(`   🎯 ROUTE C (early): pump.fun direct (BC returned false — may be RPC lag)`);
-    const pumpEarlyResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
-    if (pumpEarlyResult) {
-      routeStats.pumpFunDirect.ok++;
-      console.log(`   ✅ ROUTE C (early) success`);
-      return pumpEarlyResult;
-    }
-    routeStats.pumpFunDirect.fail++;
-    console.log(`   ⚠️  ROUTE C (early) failed — falling back to Jupiter`);
-  }
-
-  const justGraduated = hasBondingCurve && bcComplete;
-  const slippageRamp = justGraduated
-    ? [1000, 3000, 5000]           // just graduated: 10% → 30% → 50% (thin books)
-    : [300, 500, 1000, 3000, 5000]; // established: 3% → 5% → 10% → 30% → 50%
-
-  console.log(`   🎯 ROUTE B: Jupiter (${slippageRamp.map(b => b/100 + '%').join('→')}, ${JUPITER_TIMEOUT_MS/1000}s cap)`);
-
-  const _jupResult = await Promise.race([
-    (async () => {
-      for (let i = 0; i < slippageRamp.length; i++) {
-        const slipBps = slippageRamp[i];
-        if (i > 0) console.log(`   🔄 ${slipBps / 100}% slip...`);
-        const q = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports, slipBps);
-        if (!q) continue;
-        const sig = await executeJupiterSwap(connection, q);
-        if (sig) return { sig, q, slipBps };
-      }
-      return null;
-    })(),
-    new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS)),
-  ]);
-  if (_jupResult) {
-    const { sig, q, slipBps } = _jupResult;
-    routeStats.jupiterSwap.ok++;
-    const tokensOut = parseInt(q.outAmount) / 1e6;
-    const price = tokensOut > 0 ? solAmount / tokensOut : 0;
-    console.log(`   ✅ ROUTE B success (${slipBps / 100}% slippage)`);
-    return { sig, tokensOut, price };
-  }
-  routeStats.jupiterSwap.fail++;
-  console.log(`   ⚠️  ROUTE B: timed out or all tiers failed`);
-
-  // Route C (early) already tried before Jupiter — if we reach here, both failed.
-  if (!hasBondingCurve) {
-    console.log(`   🎯 ROUTE C: last-resort pump.fun (DexScreener may have missed BC)`);
-    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
-    if (pumpResult) {
-      routeStats.pumpFunDirect.ok++;
-      console.log(`   ✅ ROUTE C success`);
-      return pumpResult;
-    }
-    routeStats.pumpFunDirect.fail++;
-  }
-
-  // ─── All routes exhausted ──────────────────────────────────
-  routeStats.exhausted++;
-  const total = routeStats.pumpFunDirect.ok + routeStats.pumpFunDirect.fail +
-                routeStats.jupiterSwap.ok   + routeStats.jupiterSwap.fail;
-  if (total % 5 === 0) logRouteStats();
-  console.log(`   ❌ ROUTE ENGINE: all routes exhausted for ${label}`);
-  return null;
-}
-
 // === BUY TOKEN (Jupiter) ===
 
 // ══════════════════════════════════════════════════════════════
@@ -1260,7 +637,7 @@ async function routeEngine(connection, tokenMint, solAmount, symbol) {
 // Used when Jupiter can't route (token still on bonding curve pre-migration)
 // ══════════════════════════════════════════════════════════════
 
-async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo = null) {
+async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   if (!keypair) { console.log('   ❌ No keypair for pump.fun buy'); return null; }
 
   const mint     = new PublicKey(tokenMint);
@@ -1296,15 +673,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
   const [bondingCurve]   = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
   const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
 
-  // Use cached BC info if provided by routeEngine (avoids duplicate RPC call)
-  const bcInfo = cachedBcInfo || await connection.getAccountInfo(bondingCurve);
+  // Read bonding curve account
+  const bcInfo = await connection.getAccountInfo(bondingCurve);
   if (!bcInfo) { console.log('   ❌ Not a pump.fun token (no bonding curve)'); return null; }
-
-  // Verify owner — if it's a different program, skip silently to avoid simulation errors
-  if (!bcInfo.owner.equals(PUMP_PROGRAM)) {
-    console.log(`   ⚠️  Bonding curve account exists but is owned by ${bcInfo.owner.toBase58().slice(0,16)}... (not pump.fun) — skipping direct route`);
-    return null;
-  }
 
   const buf = bcInfo.data;
   // Layout: discriminator(8) | virtualTokenReserves(8) | virtualSolReserves(8) |
@@ -1321,20 +692,12 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
   const maxSolCost = lamports * 110n / 100n;
 
   // Get creator from bonding curve state (offset 49), derive creatorVault
-  // Layout: disc(8)+vTokRes(8)+vSolRes(8)+realTokRes(8)+realSolRes(8)+totalSup(8)+complete(1)+creator(32) = 49
-  let creator, creatorVault;
-  try {
-    creator       = new PublicKey(buf.slice(49, 81));
-    [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
-    console.log(`   🔍 pump.fun creator: ${creator.toBase58().slice(0,16)}... vault: ${creatorVault.toBase58().slice(0,16)}...`);
-  } catch (pErr) {
-    console.log(`   ❌ Failed to derive creator/vault PDA (bad bonding curve layout?): ${pErr.message}`);
-    return null;
-  }
+  const creator        = new PublicKey(buf.slice(49, 81));
+  const [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
 
-  // Read fee recipient from global state (offset 41) — cached 5 min
+  // Read fee recipient from global state (offset 41)
   let feeRecipient;
-  const globalInfo = await getCachedGlobalInfo(connection, globalPDA);
+  const globalInfo = await connection.getAccountInfo(globalPDA);
   if (globalInfo && globalInfo.data.length >= 73) {
     feeRecipient = new PublicKey(globalInfo.data.slice(41, 73));
   } else {
@@ -1342,8 +705,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
     feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
   }
 
-  // Determine token program (SPL vs Token-2022) — cached permanently (mint owner never changes)
-  const tokenProg = await getCachedTokenProg(connection, mint);
+  // Determine token program (SPL vs Token-2022) from mint account owner
+  const mintInfo  = await connection.getAccountInfo(mint);
+  const tokenProg = mintInfo?.owner.equals(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : TOKEN_SPL_PROGRAM;
 
   // Compute ATAs (manual — no @solana/spl-token needed)
   const associatedBondingCurve = getATA(bondingCurve, mint, true, tokenProg);
@@ -1351,13 +715,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
 
   const ixs = [];
 
-  // Priority fee — faster inclusion on congested Solana
-  ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }));
-  ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }));
-
-  // Create user ATA if it doesn't exist yet — cached 60s
-  const ataExists = await getCachedAtaExists(connection, associatedUser);
-  if (!ataExists) {
+  // Create user ATA if it doesn't exist yet (idempotent ix handles race conditions)
+  const userAtaInfo = await connection.getAccountInfo(associatedUser);
+  if (!userAtaInfo) {
     ixs.push(createATAIx(keypair.publicKey, associatedUser, keypair.publicKey, mint, tokenProg));
   }
 
@@ -1367,15 +727,9 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
   data.writeBigUInt64LE(amount, 8);
   data.writeBigUInt64LE(maxSolCost, 16);
 
-  // Build buy instruction in two layouts:
-  // - NEW layout (post creator-vault upgrade): has creatorVault, no RENT sysvar
-  // - OLD layout (pre creator-vault): has RENT sysvar, no creatorVault
-  // Some tokens on-chain match old layout; simulation catches which works.
-
-  const buildBuyIx = (useCreatorVault) => new TransactionInstruction({
+  ixs.push(new TransactionInstruction({
     programId: PUMP_PROGRAM,
-    keys: useCreatorVault ? [
-      // NEW layout — creatorVault at slot 10
+    keys: [
       { pubkey: globalPDA,              isSigner: false, isWritable: false },
       { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
       { pubkey: mint,                   isSigner: false, isWritable: false },
@@ -1388,90 +742,27 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount, cachedBcInfo =
       { pubkey: creatorVault,           isSigner: false, isWritable: true  },
       { pubkey: eventAuthority,         isSigner: false, isWritable: false },
       { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
-    ] : [
-      // OLD layout — RENT sysvar at slot 10 (no creatorVault)
-      { pubkey: globalPDA,              isSigner: false, isWritable: false },
-      { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
-      { pubkey: mint,                   isSigner: false, isWritable: false },
-      { pubkey: bondingCurve,           isSigner: false, isWritable: true  },
-      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true  },
-      { pubkey: associatedUser,         isSigner: false, isWritable: true  },
-      { pubkey: keypair.publicKey,      isSigner: true,  isWritable: true  },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: tokenProg,              isSigner: false, isWritable: false },
-      { pubkey: SYSVAR_RENT_PUBKEY,     isSigner: false, isWritable: false },
-      { pubkey: eventAuthority,         isSigner: false, isWritable: false },
-      { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
     ],
     data,
-  });
+  }));
 
-  const buildVtx = (buyIx, blockhash) => {
-    const allIxs = [...ixs, buyIx]; // ixs = optional ATA create ix(es)
-    const msg = new TransactionMessage({
-      payerKey: keypair.publicKey,
-      recentBlockhash: blockhash,
-      instructions: allIxs,
-    }).compileToV0Message();
-    const vtx = new VersionedTransaction(msg);
-    vtx.sign([keypair]);
-    return vtx;
-  };
-
+  // Build and send versioned transaction
   const { blockhash } = await connection.getLatestBlockhash('confirmed');
+  const msg = new TransactionMessage({
+    payerKey: keypair.publicKey,
+    recentBlockhash: blockhash,
+    instructions: ixs,
+  }).compileToV0Message();
 
-  // Try NEW layout first — pre-simulate silently
-  // IMPORTANT: simulateTransaction can THROW (not just return err) when RPC is rate-limited.
-  // Each layout gets its own try/catch so a thrown 429 on layout 1 doesn't kill layout 2.
-  let vtx = buildVtx(buildBuyIx(true), blockhash);
-  let layoutLabel = 'new (creator-vault)';
-
-  const silentSim = async (tx) => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await connection.simulateTransaction(tx, { replaceRecentBlockhash: true, commitment: 'processed' });
-      } catch (e) {
-        if (attempt === 0 && (e.message?.includes('429') || e.message?.includes('Too Many'))) {
-          await new Promise(r => setTimeout(r, 1500));
-          continue; // retry once on 429 throw
-        }
-        return { value: { err: { threw: e.message?.slice(0, 60) } } };
-      }
-    }
-    return { value: { err: { threw: 'max retries' } } };
-  };
-
-  const sim1 = await silentSim(vtx);
-  if (sim1.value.err) {
-    // NEW layout failed — fall back to OLD layout
-    console.log(`   ⚠️  pump.fun new layout sim failed (${JSON.stringify(sim1.value.err)}) — trying old layout (RENT sysvar)`);
-    vtx = buildVtx(buildBuyIx(false), blockhash);
-    layoutLabel = 'old (RENT sysvar)';
-
-    const sim2 = await silentSim(vtx);
-    if (sim2.value.err) {
-      const err2 = JSON.stringify(sim2.value.err);
-      // ProgramAccountNotFound = account hasn't propagated to RPC yet (timing at launch).
-      // Safe to send new layout directly — skipPreflight means on-chain execution decides.
-      // Any other sim error = genuine problem, bail.
-      if (err2.includes('ProgramAccountNotFound')) {
-        console.log(`   ⚠️  pump.fun both sims: ProgramAccountNotFound — sending new layout direct (account lag)`);
-        vtx = buildVtx(buildBuyIx(true), blockhash); // revert to new layout for send
-        layoutLabel = 'new (creator-vault, direct)';
-      } else {
-        console.log(`   ❌ pump.fun old layout sim also failed: ${err2} — cannot route via bonding curve`);
-        return null;
-      }
-    }
-    console.log(`   ✅ pump.fun old layout sim passed — sending`);
-  }
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([keypair]);
 
   try {
     const sig = await connection.sendRawTransaction(vtx.serialize(), {
-      skipPreflight: true, // already simulated above
+      skipPreflight: false,
       preflightCommitment: 'confirmed',
     });
-    console.log(`   ✅ Pump.fun bonding curve buy sent [${layoutLabel}]: ${sig.slice(0, 16)}...`);
+    console.log(`   ✅ Pump.fun bonding curve buy sent: ${sig.slice(0, 16)}...`);
     return { sig, tokensOut: Number(tokensOut) / 1e6, price: solAmount / (Number(tokensOut) / 1e6) };
   } catch (e) {
     console.log(`   ❌ Pump.fun direct buy failed: ${e.message?.slice(0, 100)}`);
@@ -1483,7 +774,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Safety capital scale: override any passed-in size with scaled amount
   {
     const quantMul = 1.0; // quant multiplier already applied by caller
-    const safeSize = getScaledPositionSize(quantMul, null, currentAction);
+    const safeSize = getScaledPositionSize(quantMul);
     if (Math.abs(safeSize - solAmount) > 0.001) {
       console.log(`   🛡️  CAPITAL SCALE: ${solAmount.toFixed(4)} → ${safeSize.toFixed(4)} SOL (${(portfolio.balance*100).toFixed(1)}% balance = ${(safeSize/portfolio.balance*100).toFixed(1)}% risk)`);
     }
@@ -1493,24 +784,8 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   // Safety gates: daily loss limit, drawdown circuit-breaker
   if (!checkSafetyGates()) return false;
 
-  // Rug gate: quick check before burning gas on obvious rugs
-  {
-    const _ri = await getTokenInfo(tokenMint).catch(() => null);
-    if (isLikelyRug(_ri)) {
-      console.log(`   🚫 RUG GATE: ${symbol || tokenMint.slice(0,10)} — zero liquidity or dead launch, skipping`);
-      return false;
-    }
-  }
-
-  // Profit Hunter re-entry: allow re-buying a previously profitable token
-  if (PROFIT_HUNTER_MODE && profitHunterState.reEntryAllowed.has(tokenMint)) {
-    profitHunterState.reEntryAllowed.delete(tokenMint);
-    console.log(`   ♻️  PH RE-ENTRY: buying back ${symbol || tokenMint.slice(0,8)} (previously profitable)`);
-  }
-
-  const _dynLimits = getScaledLimits();
-  if (positions.size >= _dynLimits.maxConc) {
-    console.log(`⚠️  Max positions (${_dynLimits.maxConc} ${_dynLimits.label}) reached, skipping buy`);
+  if (positions.size >= MAX_POSITIONS) {
+    console.log(`⚠️  Max positions (${MAX_POSITIONS}) reached, skipping buy`);
     return false;
   }
   if (solAmount < 0.005) {
@@ -1518,9 +793,8 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     return false;
   }
   // Cooldown: don't buy again within 2 minutes of last buy
-  const _cooldown = getScaledLimits().cooldown;
-  if (Date.now() - lastBuyTime < _cooldown) {
-    console.log(`⚠️  Cooldown active (${Math.round((_cooldown - (Date.now() - lastBuyTime)) / 1000)}s left), skipping`);
+  if (Date.now() - lastBuyTime < MIN_TRADE_COOLDOWN) {
+    console.log(`⚠️  Cooldown active (${Math.round((MIN_TRADE_COOLDOWN - (Date.now() - lastBuyTime)) / 1000)}s left), skipping`);
     return false;
   }
   // Reserve: keep minimum SOL for gas
@@ -1550,166 +824,97 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       entryTime: Date.now(),
       symbol: symbol || tokenMint.slice(0, 8),
       triggeredBy: new Set(triggeringWallets),
-      tier1Sold: false, tier2Sold: false,
       meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _pAgeH != null ? ageBracket(_pAgeH) : null, volLiqBracket: _pRatio != null ? volLiqBracket(_pRatio) : null, hourOfDay: new Date().getHours() },
     });
     portfolio.balance -= solAmount;
     lastBuyTime = Date.now();
-    recordBuyForSafety();
     logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
     console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | Tokens: ${tokenAmount.toFixed(2)}`);
     return true;
   }
 
-  // === LIVE TRADE — use Route Engine ===
-  const routeResult = await routeEngine(connection, tokenMint, solAmount, symbol);
-  if (!routeResult) {
-    console.log(`   ❌ TRADE BLOCKED: Route engine exhausted all paths for ${symbol || tokenMint.slice(0,12)}`);
-    return false;
+  // === LIVE TRADE ===
+  // Attempt Jupiter quote unconditionally — new tokens may not have DexScreener/Birdeye
+  // data yet, so we don't gate on price availability upfront.
+  console.log(`🔄 Getting Jupiter quote: ${solAmount} SOL → ${symbol || tokenMint.slice(0, 8)}`);
+  let quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  if (!quote) {
+    // Retry once after 3s — brand new pools take a moment to be indexed by Jupiter
+    console.log(`   ⏳ Quote failed, retrying in 3s (new pool may still be indexing)...`);
+    await new Promise(r => setTimeout(r, 3000));
+    quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+  }
+  if (!quote) {
+    // Jupiter failed after retry — fall back to pump.fun bonding curve direct buy
+    console.log(`   🔄 Jupiter failed, trying pump.fun bonding curve direct...`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (!pumpResult) {
+      console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
+      return false;
+    }
+    // Record position from pump.fun buy
+    const _pfAgeH = null; // pump.fun token — age not available pre-graduation
+    positions.set(tokenMint, {
+      entryPrice: pumpResult.price,
+      highestPrice: pumpResult.price,
+      amount: pumpResult.tokensOut,
+      solInvested: solAmount,
+      entryTime: Date.now(),
+      symbol: symbol || tokenMint.slice(0, 8),
+      txSignature: pumpResult.sig,
+      meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: null, hourOfDay: new Date().getHours() },
+    });
+    portfolio.balance -= solAmount;
+    lastBuyTime = Date.now();
+    logTrade('📗 BUY (pump.fun)', symbol || tokenMint.slice(0, 8), pumpResult.price);
+    console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
+    return true;
   }
 
-  // Derive price for position record
-  let price = await getTokenPrice(tokenMint).catch(() => null);
-  if (!price && routeResult.price > 0) {
-    price = routeResult.price;
-    console.log(`   ℹ️  Price derived from route result: ${price.toFixed(10)}`);
+  const expectedOut = parseInt(quote.outAmount);
+  console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
+
+  // Fetch price — derive from Jupiter quote if external APIs unavailable for this token
+  let price = await getTokenPrice(tokenMint);
+  if (!price && expectedOut > 0) {
+    const decimals = quote.outputDecimals || 6;
+    price = solAmount / (expectedOut / (10 ** decimals));
+    console.log(`   ℹ️  Price derived from Jupiter quote: $${price.toFixed(10)}`);
   }
   if (!price) {
     console.log(`   ❌ Cannot determine price for ${symbol || tokenMint.slice(0, 8)}, skipping`);
     return false;
   }
 
+  const signature = await executeJupiterSwap(connection, quote);
+  if (!signature) {
+    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
+    return false;
+  }
+
   // Record position
+  const tokenAmount = expectedOut / (10 ** (quote.outputDecimals || 6));
   const _ltinfo = await getTokenInfo(tokenMint).catch(() => null);
   const _lAgeH = _ltinfo?.createdAt ? (Date.now()/1000 - _ltinfo.createdAt)/3600 : null;
   const _lRatio = (_ltinfo?.v24hUSD && _ltinfo?.liquidity) ? _ltinfo.v24hUSD / _ltinfo.liquidity : null;
   positions.set(tokenMint, {
     entryPrice: price,
     highestPrice: price,
-    amount: routeResult.tokensOut,
+    amount: tokenAmount,
     solInvested: solAmount,
     entryTime: Date.now(),
     symbol: symbol || tokenMint.slice(0, 8),
-    txSignature: routeResult.sig,
-    tier1Sold: false, tier2Sold: false,
-    meta: { source: (triggeringWallets && triggeringWallets.size) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
+    txSignature: signature,
+    meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: _lAgeH != null ? ageBracket(_lAgeH) : null, volLiqBracket: _lRatio != null ? volLiqBracket(_lRatio) : null, hourOfDay: new Date().getHours() },
   });
   portfolio.balance -= solAmount;
   lastBuyTime = Date.now();
-  recordBuyForSafety();
   logTrade('📗 BUY', symbol || tokenMint.slice(0, 8), price);
-  console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${routeResult.sig.slice(0, 16)}...`);
+  console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
   return true;
 }
 
-
-// ══════════════════════════════════════════════════════════════
-// === PUMP.FUN DIRECT SELL ===
-// Sells tokens back to the bonding curve without Jupiter.
-// Only works when the token is still on an active bonding curve (not yet graduated).
-// Returns { sig, solReceived } or null on failure.
-// ══════════════════════════════════════════════════════════════
-async function sellPumpFunDirect(connection, tokenMint, tokenAmount, decimals) {
-  try {
-    const mint = new PublicKey(tokenMint);
-    const [bondingCurve]   = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.toBuffer()], PUMP_PROGRAM);
-    const [globalPDA]      = PublicKey.findProgramAddressSync([Buffer.from('global')], PUMP_PROGRAM);
-    const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
-
-    const bcInfo = await connection.getAccountInfo(bondingCurve);
-    if (!bcInfo || !bcInfo.owner.equals(PUMP_PROGRAM)) {
-      console.log('   ⚠️  sellPumpFunDirect: no active BC — token may have graduated');
-      return null;
-    }
-    const buf = bcInfo.data;
-    if (buf[48] === 1) {
-      console.log('   ⚠️  sellPumpFunDirect: BC complete — token graduated, use Jupiter');
-      return null;
-    }
-
-    const virtualTokenReserves = buf.readBigUInt64LE(8);
-    const virtualSolReserves   = buf.readBigUInt64LE(16);
-    const amountRaw = BigInt(Math.floor(tokenAmount * (10 ** decimals)));
-
-    // Bonding curve sell math: solOut = vSolRes * amount / (vTokRes + amount)
-    const expectedSolOut = (virtualSolReserves * amountRaw) / (virtualTokenReserves + amountRaw);
-    const minSolOutput   = expectedSolOut * 90n / 100n;  // 10% slippage tolerance
-
-    // Read fee recipient from global state
-    let feeRecipient;
-    const globalInfo = await getCachedGlobalInfo(connection, globalPDA);
-    if (globalInfo && globalInfo.data.length >= 73) {
-      feeRecipient = new PublicKey(globalInfo.data.slice(41, 73));
-    } else {
-      feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
-    }
-
-    // Creator vault
-    let creatorVault;
-    try {
-      const creator = new PublicKey(buf.slice(49, 81));
-      [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM);
-    } catch (e) {
-      console.log(`   ❌ sellPumpFunDirect: creator vault PDA failed: ${e.message}`);
-      return null;
-    }
-
-    const tokenProg              = await getCachedTokenProg(connection, mint);
-    const associatedBondingCurve = getATA(bondingCurve, mint, true,  tokenProg);
-    const associatedUser         = getATA(keypair.publicKey, mint, false, tokenProg);
-
-    // Build sell instruction data: discriminator(8) + tokenAmount(u64) + minSolOutput(u64)
-    const data = Buffer.alloc(24);
-    PUMP_SELL_DISCRIMINATOR.copy(data, 0);
-    data.writeBigUInt64LE(amountRaw,    8);
-    data.writeBigUInt64LE(minSolOutput, 16);
-
-    const sellIx = new TransactionInstruction({
-      programId: PUMP_PROGRAM,
-      keys: [
-        { pubkey: globalPDA,              isSigner: false, isWritable: false },
-        { pubkey: feeRecipient,           isSigner: false, isWritable: true  },
-        { pubkey: mint,                   isSigner: false, isWritable: false },
-        { pubkey: bondingCurve,           isSigner: false, isWritable: true  },
-        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true  },
-        { pubkey: associatedUser,         isSigner: false, isWritable: true  },
-        { pubkey: keypair.publicKey,      isSigner: true,  isWritable: true  },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: tokenProg,              isSigner: false, isWritable: false },
-        { pubkey: creatorVault,           isSigner: false, isWritable: true  },
-        { pubkey: eventAuthority,         isSigner: false, isWritable: false },
-        { pubkey: PUMP_PROGRAM,           isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    const msg = new TransactionMessage({
-      payerKey: keypair.publicKey,
-      recentBlockhash: blockhash,
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500_000 }),
-        sellIx,
-      ],
-    }).compileToV0Message();
-    const vtx = new VersionedTransaction(msg);
-    vtx.sign([keypair]);
-
-    const sig = await connection.sendRawTransaction(vtx.serialize(), {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
-    });
-    const solReceived = Number(expectedSolOut) / LAMPORTS_PER_SOL;
-    console.log(`   ✅ sellPumpFunDirect: ${tokenAmount.toFixed(0)} tokens → ${solReceived.toFixed(4)} SOL | ${sig.slice(0, 12)}...`);
-    return { sig, solReceived };
-  } catch (e) {
-    console.log(`   ❌ sellPumpFunDirect failed: ${e.message?.slice(0, 100)}`);
-    return null;
-  }
-}
-
-// === SELL TOKEN (Jupiter + pump.fun direct fallback) ===
+// === SELL TOKEN (Jupiter) ===
 async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const position = positions.get(tokenMint);
   if (!position) return false;
@@ -1737,7 +942,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
     positions.delete(tokenMint);
     logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
     console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
-    recordTradeForSafety(pnlSol, pnlPercent);
+    recordTradeForSafety(pnlSol);
     const _closedTrade_p = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
     recordPatternOutcome(_closedTrade_p);
     saveMemory(_closedTrade_p);
@@ -1750,59 +955,19 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   const decimals = tokenInfo?.decimals || 9;
   const amountRaw = Math.floor(position.amount * (10 ** decimals));
 
-  // --- SELL ROUTE A: pump.fun direct (if token still on bonding curve) ---
-  // Avoids Jupiter entirely for BC tokens — critical on Railway where Jupiter DNS is unreliable
-  const bcInfoForSell = await getBondingCurveInfo(connection, tokenMint);
-  if (bcInfoForSell.hasBondingCurve && !bcInfoForSell.bcComplete) {
-    console.log(`🎯 SELL ROUTE A: pump.fun direct (active BC) — ${position.symbol} (${reason})`);
-    const directSell = await sellPumpFunDirect(connection, tokenMint, position.amount, decimals);
-    if (directSell) {
-      const pnlSol = directSell.solReceived - position.solInvested;
-      portfolio.balance += directSell.solReceived;
-      portfolio.totalPnl += pnlSol;
-      if (position.triggeredBy) {
-        const won = pnlPercent > 0;
-        for (const w of position.triggeredBy) updateKolScore(w, won, pnlPercent);
-      }
-      positions.delete(tokenMint);
-      logTrade(`📕 SELL [BC] (${reason})`, position.symbol, currentPrice, pnlPercent);
-      console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | Balance: ${portfolio.balance.toFixed(4)} SOL`);
-      recordTradeForSafety(pnlSol, pnlPercent);
-      try {
-        const _cp = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
-        recordPatternOutcome(_cp); saveMemory(_cp);
-      } catch {}
-      return true;
-    }
-    console.log(`   ⚠️  SELL ROUTE A failed — falling back to Jupiter`);
-  }
-
-  // --- SELL ROUTE B: Jupiter (graduated tokens or when BC sell fails) ---
-  console.log(`🔄 Getting sell quote: ${position.symbol} → SOL (${reason})`);
-  const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
-  const _sellQ = await Promise.race([
-    (async () => {
-      for (let si = 0; si < sellSlippageRamp.length; si++) {
-        if (si > 0) console.log(`   🔄 Sell → ${sellSlippageRamp[si]/100}% slip...`);
-        const q = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw, sellSlippageRamp[si]);
-        if (q) return q;
-      }
-      return null;
-    })(),
-    new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS + 1000)),
-  ]);
-  if (!_sellQ) {
-    console.log(`   ❌ Sell: timeout or no route — retry next cycle`);
+  console.log(`🔄 Getting Jupiter quote: ${position.symbol} → SOL (${reason})`);
+  const quote = await getJupiterQuote(tokenMint, SOL_MINT, amountRaw);
+  if (!quote) {
+    console.log(`   ❌ Quote failed for sell — will retry next cycle`);
     return false;
   }
-  const quote = _sellQ;
 
   const expectedSolBack = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
   console.log(`   📊 Quote: ${expectedSolBack.toFixed(4)} SOL back`);
 
   const signature = await executeJupiterSwap(connection, quote);
   if (!signature) {
-    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${position.symbol} — check TX error above`);
+    console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
     return false;
   }
 
@@ -1823,7 +988,7 @@ async function sellToken(connection, tokenMint, reason, knownPrice = null) {
   }
   logTrade(`📕 SELL (${reason})`, position.symbol, currentPrice, pnlPercent);
   console.log(`   └─ PnL: ${pnlSol > 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
-  recordTradeForSafety(pnlSol, pnlPercent);
+  recordTradeForSafety(pnlSol);
   const _closedTrade_l = { time: new Date().toISOString(), symbol: position.symbol, mint: tokenMint, entryPrice: position.entryPrice, exitPrice: currentPrice, pnlPercent, pnlSol, tx: signature, source: position.meta?.source || 'kol', ageBracket: position.meta?.ageBracket, volLiqBracket: position.meta?.volLiqBracket, hourOfDay: position.meta?.hourOfDay };
   recordPatternOutcome(_closedTrade_l);
   saveMemory(_closedTrade_l);
@@ -1843,35 +1008,13 @@ function evaluatePosition(tokenMint, currentPrice) {
     position.highestPrice = currentPrice;
   }
 
-  // PROFIT HUNTER: Fast-cut if down quickly on new entry
-  if (PROFIT_HUNTER_MODE) {
-    const holdMs = Date.now() - position.entryTime;
-    if (holdMs < PH_FAST_STOP_WINDOW_MS && pnlPercent <= -PH_FAST_STOP_PCT) {
-      return { action: 'SELL', reason: `🔴 PH FAST STOP (${holdMs < 60000 ? Math.round(holdMs/1000)+'s' : Math.round(holdMs/60000)+'m'})`, pnlPercent };
-    }
-  }
-
   // HARD STOP-LOSS
   if (pnlPercent <= -STOP_LOSS_PERCENT) {
     return { action: 'SELL', reason: '🔴 STOP LOSS', pnlPercent };
   }
 
-  // TIERED TAKE-PROFIT — partial sells to lock gains while letting runners run
-  // Tier 1: sell 40% at +75%
-  if (!position.tier1Sold && pnlPercent >= TP_TIER1_PCT) {
-    position.tier1Sold = true;
-    console.log(`   🎯 T1 TRIGGER: ${position.symbol} +${pnlPercent.toFixed(1)}% ≥ +${TP_TIER1_PCT}% → selling 40%`);
-    return { action: 'PARTIAL_SELL', ratio: 0.40, reason: `💰 TIER1 TP +${TP_TIER1_PCT}%`, pnlPercent };
-  }
-  // Tier 2: sell 40% at +125% (only 20% of original remains after T1+T2)
-  if (position.tier1Sold && !position.tier2Sold && pnlPercent >= TP_TIER2_PCT) {
-    position.tier2Sold = true;
-    console.log(`   🎯 T2 TRIGGER: ${position.symbol} +${pnlPercent.toFixed(1)}% ≥ +${TP_TIER2_PCT}% → selling 40% more`);
-    return { action: 'PARTIAL_SELL', ratio: 0.40, reason: `💰 TIER2 TP +${TP_TIER2_PCT}%`, pnlPercent };
-  }
-
-  // FULL TAKE PROFIT (if tiers not triggered — token went straight to target)
-  if (!position.tier1Sold && pnlPercent >= TAKE_PROFIT_PERCENT) {
+  // TAKE PROFIT
+  if (pnlPercent >= TAKE_PROFIT_PERCENT) {
     return { action: 'SELL', reason: '🟢 TAKE PROFIT', pnlPercent };
   }
 
@@ -1884,69 +1027,6 @@ function evaluatePosition(tokenMint, currentPrice) {
   }
 
   return { action: 'HOLD', reason: '⏳ HOLDING', pnlPercent };
-}
-
-// === PARTIAL SELL (Tiered Take-Profits) ===
-async function partialSellToken(connection, tokenMint, ratio, reason, knownPrice = null) {
-  const position = positions.get(tokenMint);
-  if (!position) return false;
-
-  const sellRatio = Math.min(1.0, Math.max(0.01, ratio));
-  const tokenAmountToSell = position.amount * sellRatio;
-
-  let currentPrice = knownPrice || await getTokenPrice(tokenMint);
-  if (!currentPrice) currentPrice = position.entryPrice;
-
-  const proceedsSol = tokenAmountToSell * currentPrice;
-  const pnlSol = proceedsSol - (position.solInvested * sellRatio);
-  const pnlPercent = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
-
-  if (PAPER_MODE) {
-    position.amount -= tokenAmountToSell;
-    position.solInvested *= (1 - sellRatio);
-    portfolio.balance += proceedsSol;
-    portfolio.totalPnl += pnlSol;
-    logTrade(`📙 PARTIAL SELL ${(sellRatio*100).toFixed(0)}% (${reason})`, position.symbol, currentPrice, pnlPercent);
-    console.log(`   └─ Sold ${(sellRatio*100).toFixed(0)}% | +${proceedsSol.toFixed(4)} SOL | Remaining: ${position.amount.toFixed(2)} tokens`);
-    return true;
-  }
-
-  // Live partial sell via Jupiter — escalating slippage
-  try {
-    const tokenDecimals = 6;
-    const rawAmount = Math.floor(tokenAmountToSell * (10 ** tokenDecimals));
-    const sellSlippageRamp = [300, 500, 1000, 2000, 5000]; // 3%→5%→10%→20%→50%
-    const _pSellQ = await Promise.race([
-      (async () => {
-        for (let si = 0; si < sellSlippageRamp.length; si++) {
-          if (si > 0) console.log(`   🔄 Partial sell → ${sellSlippageRamp[si]/100}% slip...`);
-          const q = await getJupiterQuote(tokenMint, SOL_MINT, rawAmount, sellSlippageRamp[si]);
-          if (q) return q;
-        }
-        return null;
-      })(),
-      new Promise(r => setTimeout(() => r(null), JUPITER_TIMEOUT_MS + 1000)),
-    ]);
-    if (!_pSellQ) {
-      console.log(`   ⚠️  Partial sell: timeout or no route — keeping position`);
-      return false;
-    }
-    const quote = _pSellQ;
-    const signature = await executeJupiterSwap(connection, quote);
-    if (!signature) return false;
-
-    const solOut = parseInt(quote.outAmount) / 1e9;
-    position.amount -= tokenAmountToSell;
-    position.solInvested *= (1 - sellRatio);
-    portfolio.balance += solOut;
-    portfolio.totalPnl += (solOut - position.solInvested * sellRatio);
-    logTrade(`📙 PARTIAL SELL ${(sellRatio*100).toFixed(0)}% (${reason})`, position.symbol, currentPrice, pnlPercent);
-    console.log(`   └─ Sold ${(sellRatio*100).toFixed(0)}% | +${solOut.toFixed(4)} SOL | TX: ${signature.slice(0,16)}...`);
-    return true;
-  } catch (e) {
-    console.log(`   ❌ Partial sell failed: ${e.message?.slice(0,80)}`);
-    return false;
-  }
 }
 
 // === WALLET MONITORING (Copy Trading Core) ===
@@ -2032,16 +1112,13 @@ async function monitorCopyWallets(connection) {
                         console.log(`   ℹ️  ${symbol} — no Birdeye data yet, trusting multi-KOL consensus`);
                       }
 
-                      const { multiplier: _qMul, action: _qAct, score: _qScore } = quantifySignal([...signal.wallets], info, 'kol');
-                      const { boost: _aiBoost, verdict: _aiVerdict } = await aiAnalyzeSignal(info, 'kol');
-                      const _finalScore = (_qScore || 0) + _aiBoost;
-                      if (_qAct === 'SKIP' && _aiVerdict !== 'BUY') {
-                        console.log(`   ⏭️  QUANT+AI: KOL signal skipped (score=${_finalScore})`);
+                      const { multiplier: _qMul, action: _qAct } = quantifySignal([...signal.wallets], info, 'kol');
+                      if (_qAct === 'SKIP') {
+                        console.log(`   ⏭️  QUANT: KOL signal skipped (low score)`);
                         kolSignals.delete(tokenMint);
                         continue;
                       }
-                      const _aiSizeMul = _aiBoost >= 15 ? 1.2 : 1.0; // AI conviction bump
-                      const tradeSize = Math.min(getDynamicPositionSize([...signal.wallets]) * _qMul * _aiSizeMul, portfolio.balance * 0.25);
+                      const tradeSize = Math.min(getDynamicPositionSize([...signal.wallets]) * _qMul, portfolio.balance * 0.2);
                       console.log(`   🚀 CONSENSUS COPY: Buy ${symbol} with ${tradeSize.toFixed(4)} SOL (${signal.wallets.size} KOLs confirmed)`);
                       await buyToken(connection, tokenMint, tradeSize, symbol, signal.wallets);
                       kolSignals.delete(tokenMint); // Clear after execution
@@ -2102,20 +1179,11 @@ async function scanNewTokens(connection) {
       if (!rawTokens.includes(t.tokenAddress)) rawTokens.push(t.tokenAddress);
     });
   }
-  // Source 3: DexScreener trending — highest-momentum tokens right now
-  const trending = await safeFetch('https://api.dexscreener.com/latest/dex/tokens/trending');
-  if (trending?.pairs) {
-    trending.pairs.filter(p => p.chainId === 'solana').forEach(p => {
-      if (p.baseToken?.address && !rawTokens.includes(p.baseToken.address)) {
-        rawTokens.push(p.baseToken.address);
-      }
-    });
-  }
 
-  rawTokens = rawTokens.filter(addr => !positions.has(addr)).slice(0, 20);
+  rawTokens = rawTokens.filter(addr => !positions.has(addr)).slice(0, 15);
   if (rawTokens.length === 0) return;
 
-  console.log(`🔍 Scanning ${rawTokens.length} DexScreener candidates (boosted+profiles+trending)...`);
+  console.log(`🔍 Scanning ${rawTokens.length} DexScreener candidates...`);
 
   // Score each token using DexScreener pair data (getTokenInfo now uses DexScreener)
   for (const addr of rawTokens) {
@@ -2136,63 +1204,17 @@ async function scanNewTokens(connection) {
 
     console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
-    // FILTERS — v9.0 PLANETARY: floors dropped, age window widened
-    // Ghost-liquidity bypass: pump.fun tokens <2h old often show $0 liq on DexScreener
-    const isGhostLiq = liq === 0 && ageHours < 2.0 && vol24h >= 30000 && chg1h >= 10;
-    if (isGhostLiq) {
-      console.log(`      ↳ 👻 GHOST LIQ: $0 liq but ${ageHours.toFixed(1)}h old, $${Math.round(vol24h/1000)}k vol, +${chg1h.toFixed(1)}% — trying anyway`);
-    }
-    if (!isGhostLiq && liq < 3000)  { console.log(`      ↳ skip: low liq`);        continue; }  // $8k→$3k
-    if (vol24h < 5000)   { console.log(`      ↳ skip: low vol`);         continue; }  // $15k→$5k
-    if (ageHours > 48)   { console.log(`      ↳ skip: too old`);         continue; }  // 36h→48h
-    if (chg1h < -10)     { console.log(`      ↳ skip: dumping hard`);    continue; }  // was chg1h<=0; now allow flat/sideways
-    if (!isGhostLiq && volLiqRatio < 0.25){ console.log(`      ↳ skip: low turnover`); continue; }  // 0.5→0.25
+    // FILTERS — fresh momentum only:
+    if (liq < 30000)      { console.log(`      ↳ skip: low liq`);        continue; }
+    if (vol24h < 50000)   { console.log(`      ↳ skip: low vol`);         continue; }
+    if (ageHours > 8)     { console.log(`      ↳ skip: too old`);         continue; }
+    if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
+    if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
-    const { multiplier: _sqMul, action: _sqAct, score: _sqScore } = quantifySignal([], info, 'scanner');
-    const { boost: _sqAiBoost, verdict: _sqAiVerdict } = await aiAnalyzeSignal(info, 'scanner');
-    const _sqFinalScore = (_sqScore || 0) + _sqAiBoost;
-    if (_sqAct === 'SKIP' && _sqAiVerdict !== 'BUY') { console.log(`   ⏭️  QUANT+AI: scanner signal skipped (score=${_sqFinalScore})`); continue; }
-    console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters! (score=${_sqFinalScore} | AI=${_sqAiVerdict})`);
-
-    // Ghost-liquidity tokens: route engine handles bonding curve detection automatically
-    if (isGhostLiq) {
-      const ghostSize = Math.min(MAX_POSITION_SIZE_SOL * 0.85, portfolio.balance * 0.20); // flexed
-      console.log(`   👻 GHOST-LIQ BUY: ${symbol} reduced size ${ghostSize.toFixed(4)} SOL → route engine`);
-      const ghostResult = await routeEngine(connection, addr, ghostSize, symbol);
-      if (ghostResult) {
-        // Record position (route engine returns raw result, not position — need buyToken logic)
-        // Fall through to buyToken which uses routeEngine internally
-        console.log(`   ✅ Ghost-liq route engine success: ${symbol}`);
-        break;
-      }
-      console.log(`   ⛔ ${symbol}: all routes failed (ghost-liq unroutable) — scanning next token`);
-      continue;
-    }
-
-    // Profit Hunter: momentum boost for hot tokens
-    let _sqSizeMul = _sqAiBoost >= 15 ? 1.2 : 1.0;
-    if (PROFIT_HUNTER_MODE) {
-      const ph5m = info.priceChange5mPercent || 0;
-      const ph1h = info.priceChange1hPercent || 0;
-      if (ph5m >= PH_MOMENTUM_5M_MIN && ph1h >= PH_MOMENTUM_1H_MIN) {
-        _sqSizeMul *= PH_MOMENTUM_SIZE_BOOST;
-        console.log(`   🎯🔥 PROFIT HUNTER BOOST: ${symbol} 5m=${ph5m.toFixed(1)}% 1h=${ph1h.toFixed(1)}% → size ×${_sqSizeMul.toFixed(2)}`);
-      }
-      // Streak reinvestment — if on a hot streak, allow larger cap
-      const streakCapMul = profitHunterState.consecutiveWins >= PH_STREAK_THRESHOLD ? PH_STREAK_CAP_BOOST : 1.0;
-      if (streakCapMul > 1.0) console.log(`   🔥 STREAK BONUS: ${profitHunterState.consecutiveWins} wins → cap ×${streakCapMul}`);
-      currentAction = _sqAct;
-      const confBalCap = (CONFIDENCE_BALANCE_CAP[_sqAct] ?? 0.20) * portfolio.balance;
-      const capSol = Math.min(MAX_POSITION_SIZE_SOL * streakCapMul, confBalCap);
-      const tradeSize = Math.min(capSol * _sqSizeMul, confBalCap); // confidence-gated
-      console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
-      const bought = await buyToken(connection, addr, tradeSize, symbol);
-      if (bought) break;
-      continue;
-    }
-    currentAction = _sqAct;
-    const _confCapSol = (CONFIDENCE_BALANCE_CAP[_sqAct] ?? 0.20) * portfolio.balance;
-    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqSizeMul, _confCapSol); // confidence-gated
+    const { multiplier: _sqMul, action: _sqAct } = quantifySignal([], info, 'scanner');
+    if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
+    console.log(`   🎯 INDEPENDENT SIGNAL: ${symbol} passed all filters!`);
+    const tradeSize = Math.min(MAX_POSITION_SIZE_SOL * _sqMul, portfolio.balance * 0.15);
     console.log(`   🚀 AUTO-BUY: ${symbol} with ${tradeSize.toFixed(4)} SOL (independent signal)`);
     const bought = await buyToken(connection, addr, tradeSize, symbol);
     if (bought) break; // One independent trade per scan cycle
@@ -2232,24 +1254,13 @@ async function monitorPositions(connection) {
 
     // Force exit after 30 minutes regardless (memecoin alpha decays fast)
     const holdTime = Math.round((Date.now() - position.entryTime) / 60000);
-    // PROFIT HUNTER: Let runners run — don't evict if up > PH_RUN_THRESHOLD_PCT
-    const runnerException = PROFIT_HUNTER_MODE && result.pnlPercent >= PH_RUN_THRESHOLD_PCT;
-    if (holdTime > 30 && result.action !== 'SELL' && !runnerException) {
+    if (holdTime > 30 && result.action !== 'SELL') {
       console.log(`   ⏰ ${position.symbol} held ${holdTime}m — force-closing (max hold exceeded)`);
       await sellToken(connection, mint, '⏰ MAX HOLD TIME', currentPrice);
       continue;
     }
 
-    if (result.action === 'PARTIAL_SELL') {
-      await partialSellToken(connection, mint, result.ratio, result.reason, currentPrice);
-      continue; // Don't remove position — it's still open
-    }
     if (result.action === 'SELL') {
-      // Profit Hunter: track profitable exits for potential re-entry
-      if (PROFIT_HUNTER_MODE && result.pnlPercent > 20) {
-        profitHunterState.reEntryAllowed.add(mint);
-        console.log(`   ♻️  PH RE-ENTRY: ${position.symbol} marked for potential re-entry`);
-      }
       await sellToken(connection, mint, result.reason, currentPrice);
     } else {
       console.log(`   ${result.reason} ${position.symbol} | PnL: ${result.pnlPercent > 0 ? '+' : ''}${result.pnlPercent.toFixed(1)}% | ${holdTime}m`);
@@ -2279,193 +1290,8 @@ function showStatus() {
 }
 
 // === MAIN ===
-// ══════════════════════════════════════════════════════════════
-// PLANETARY SCALE — Dynamic capital scaling
-// As balance grows, all limits auto-expand. Built to handle 0.2 SOL today
-// and 1,000 SOL tomorrow without a single config change.
-// ══════════════════════════════════════════════════════════════
-function getScaledLimits() {
-  const bal = portfolio.balance;
-  // Each tier unlocks larger positions, more concurrent slots, faster cycling
-  if (bal >= 100.0) return { maxPosSol: bal * 0.045, maxConc: 28, cooldown: 10000, label: '🌍 TITAN' };
-  if (bal >= 50.0)  return { maxPosSol: bal * 0.052, maxConc: 23, cooldown: 12000, label: '🌏 MACRO' };
-  if (bal >= 20.0)  return { maxPosSol: bal * 0.058, maxConc: 20, cooldown: 15000, label: '🌐 SCALE' };
-  if (bal >= 10.0)  return { maxPosSol: bal * 0.065, maxConc: 17, cooldown: 18000, label: '🔥 SURGE' };
-  if (bal >= 5.0)   return { maxPosSol: bal * 0.075, maxConc: 15, cooldown: 22000, label: '⚡ STORM' };
-  if (bal >= 2.0)   return { maxPosSol: bal * 0.080, maxConc: 13, cooldown: 26000, label: '🚀 BOOST' };
-  if (bal >= 1.0)   return { maxPosSol: bal * 0.085, maxConc: 11, cooldown: 28000, label: '💫 GROW'  };
-  if (bal >= 0.5)   return { maxPosSol: bal * 0.100, maxConc: 10, cooldown: 22000, label: '🌱 SEED'  };
-  if (bal >= 0.15)  return { maxPosSol: bal * 0.130, maxConc:  9, cooldown: 16000, label: '🔬 MICRO' };
-  // Base case: current config
-  return { maxPosSol: MAX_POSITION_SIZE_SOL, maxConc: MAX_POSITIONS, cooldown: MIN_TRADE_COOLDOWN, label: '⚙️ BASE' };
-}
-
-// ══════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════
-// SNIPE ENGINE — Real-time pump.fun launch + graduation sniping
-// LAUNCH:     fires on Instruction:Create  (<200ms after detection)
-// GRADUATION: fires on Instruction:Withdraw (bonding curve complete → Raydium)
-// Both skip quant/AI when SNIPE_BYPASS_QUANT=true — raw speed over signal quality.
-// ══════════════════════════════════════════════════════════════
-const _recentLaunchSigs = new Set(); // dedup processed TXs
-
-// Helper: fast mint extraction from parsed TX
-function extractMintFromTx(tx) {
-  // Primary: postTokenBalances (most reliable when available)
-  const fromBalances = tx.meta?.postTokenBalances?.[0]?.mint;
-  if (fromBalances) return fromBalances;
-  // Fallback: first writable non-signer in account keys (the newly created mint)
-  const keys = tx.transaction?.message?.accountKeys || [];
-  for (const k of keys) {
-    const pk = k.pubkey?.toString?.() || k.toString?.();
-    if (pk && pk.length === 44 && !pk.startsWith('11111111') && !pk.startsWith('Token') && !pk.startsWith('Sysvar')) {
-      return pk;
-    }
-  }
-  return null;
-}
-
-async function startPumpLaunchSubscription(connection) {
-  console.log('⚡ SNIPE ENGINE: Subscribing to pump.fun launch + graduation feeds...');
-
-  connection.onLogs(PUMP_PROGRAM, async ({ signature, err, logs }) => {
-    if (err) return;
-    if (_recentLaunchSigs.has(signature)) return;
-    _recentLaunchSigs.add(signature);
-    if (_recentLaunchSigs.size > 2000) _recentLaunchSigs.delete(_recentLaunchSigs.values().next().value);
-
-    const isLaunch = logs.some(l => l.includes('Instruction: Create'));
-    const isGrad   = SNIPE_GRAD_ENABLED && logs.some(l =>
-      l.includes('Instruction: Withdraw') || l.includes('Instruction: SetComplete') || l.includes('complete: true')
-    );
-    if (!isLaunch && !isGrad) return;
-
-    try {
-      // Fetch TX to extract mint address
-      const tx = await connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0, commitment: 'confirmed',
-      });
-      if (!tx) return;
-
-      const mintAddr = extractMintFromTx(tx);
-      if (!mintAddr) return;
-      if (positions.has(mintAddr)) return;
-      if (_snipeActive.has(mintAddr)) return;
-
-      // ── GRADUATION SNIPE ────────────────────────────────────────────────
-      if (isGrad && !isLaunch) {
-        snipeStats.grads++;
-        console.log(`\n🎓⚡ GRAD SNIPE: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
-        // Clear stale BC cache — token is now graduated
-        bcCache.delete(mintAddr);
-
-        _snipeActive.add(mintAddr);
-        try {
-          // Wait briefly for Raydium pool initialisation
-          await new Promise(r => setTimeout(r, SNIPE_GRAD_DELAY_MS));
-
-          if (positions.size >= SNIPE_MAX_CONCURRENT) {
-            console.log(`   ⚠️  GRAD SNIPE: ${SNIPE_MAX_CONCURRENT} snipes active — deferring`);
-            return;
-          }
-          if (portfolio.balance < SNIPE_GRAD_SIZE_SOL + ABSOLUTE_FLOOR_SOL) {
-            console.log(`   ⚠️  GRAD SNIPE: insufficient balance`);
-            return;
-          }
-
-          console.log(`   🎓⚡ GRAD BUY: ${mintAddr.slice(0,12)}... | ${SNIPE_GRAD_SIZE_SOL} SOL | slippage=${SNIPE_GRAD_SLIPPAGE_BPS/100}%`);
-          const q = await getJupiterQuote(SOL_MINT, mintAddr,
-            Math.floor(SNIPE_GRAD_SIZE_SOL * 1e9), SNIPE_GRAD_SLIPPAGE_BPS);
-          if (q) {
-            const sig = await executeJupiterSwap(connection, q);
-            if (sig) {
-              snipeStats.ok++;
-              const tokensOut = parseInt(q.outAmount) / 1e6;
-              positions.set(mintAddr, {
-                mint: mintAddr, symbol: mintAddr.slice(0,8), entryPrice: SNIPE_GRAD_SIZE_SOL / tokensOut,
-                entryTime: Date.now(), solSpent: SNIPE_GRAD_SIZE_SOL, tokensHeld: tokensOut,
-                highWaterMark: SNIPE_GRAD_SIZE_SOL / tokensOut, isSnipe: true, isGrad: true,
-              });
-              console.log(`   ✅ GRAD SNIPE success: ${sig.slice(0,16)}...`);
-            } else { snipeStats.fail++; }
-          } else {
-            snipeStats.fail++;
-            console.log(`   ❌ GRAD SNIPE: no Jupiter quote yet`);
-          }
-        } finally { _snipeActive.delete(mintAddr); }
-        return;
-      }
-
-      // ── LAUNCH SNIPE ─────────────────────────────────────────────────────
-      snipeStats.launches++;
-      console.log(`\n⚡ LAUNCH SNIPE: ${mintAddr.slice(0,12)}... | ${new Date().toLocaleTimeString()}`);
-
-      // Snipe concurrency guard
-      if (_snipeActive.size >= SNIPE_MAX_CONCURRENT) {
-        console.log(`   ⚠️  LAUNCH SNIPE: ${SNIPE_MAX_CONCURRENT} snipes in flight — skipping`);
-        return;
-      }
-      if (portfolio.balance < SNIPE_SIZE_SOL + ABSOLUTE_FLOOR_SOL) {
-        console.log(`   ⚠️  LAUNCH SNIPE: insufficient balance`);
-        return;
-      }
-
-      _snipeActive.add(mintAddr);
-      try {
-        // Minimal delay for TX propagation
-        if (SNIPE_LAUNCH_DELAY_MS > 0) await new Promise(r => setTimeout(r, SNIPE_LAUNCH_DELAY_MS));
-
-        if (SNIPE_BYPASS_QUANT) {
-          // Pure speed: route engine directly (BC detection → pump.fun direct)
-          console.log(`   ⚡ SNIPE BUY (bypass quant): ${SNIPE_SIZE_SOL} SOL → pump.fun direct`);
-          const result = await routeEngine(connection, mintAddr, SNIPE_SIZE_SOL, mintAddr.slice(0,8));
-          if (result) {
-            snipeStats.ok++;
-            console.log(`   ✅ LAUNCH SNIPE success | stats: ${snipeStats.ok}✅ ${snipeStats.fail}❌ of ${snipeStats.launches} launches`);
-          } else {
-            snipeStats.fail++;
-            console.log(`   ❌ LAUNCH SNIPE failed | stats: ${snipeStats.ok}✅ ${snipeStats.fail}❌`);
-          }
-        } else {
-          // Quant-gated path (SNIPE_BYPASS_QUANT=false) — same as old launch logic
-          await new Promise(r => setTimeout(r, 8000 - SNIPE_LAUNCH_DELAY_MS));
-          const info = await getTokenInfo(mintAddr);
-          if (!info?.price) { console.log(`   ↳ skip: no price after delay`); return; }
-          const { multiplier: _lMul, action: _lAct, score: _lScore } = quantifySignal([], info, 'launch');
-          const { boost: _lBoost, verdict: _lVerdict } = await aiAnalyzeSignal(info, 'launch');
-          if (_lAct === 'SKIP' && _lVerdict !== 'BUY' && (_lScore + _lBoost) < 15) return;
-          const scaleLimits = getScaledLimits();
-          const launchSize = Math.min(scaleLimits.maxPosSol * 0.90, portfolio.balance * 0.25);
-          await routeEngine(connection, mintAddr, launchSize, info.symbol || mintAddr.slice(0,8));
-        }
-      } finally { _snipeActive.delete(mintAddr); }
-
-    } catch (snipeErr) {
-      console.log(`   ⚠️  Snipe handler error: ${snipeErr.message?.slice(0,80)}`);
-      _snipeActive.delete(mintAddr);
-    }
-  }, 'confirmed');
-
-  console.log(`✅ SNIPE ENGINE active | launch_delay=${SNIPE_LAUNCH_DELAY_MS}ms | grad_snipe=${SNIPE_GRAD_ENABLED} | bypass_quant=${SNIPE_BYPASS_QUANT} | size=${SNIPE_SIZE_SOL}/${SNIPE_GRAD_SIZE_SOL} SOL`);
-}
-
 async function main() {
-  // Build primary RPC URL; fall back to public endpoint if Helius key is missing
-  const _primaryRpc = HELIUS_KEY
-    ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
-    : BACKUP_RPC;
-  const connection = new Connection(_primaryRpc, { commitment: 'confirmed' });
-  // Quick connectivity probe — failover to backup if primary unreachable
-  try {
-    await Promise.race([
-      connection.getVersion(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
-    ]);
-    console.log(`🔗 RPC: ${_primaryRpc.split('?')[0]}`);
-  } catch (_rpcErr) {
-    console.log(`⚠️  Primary RPC unreachable (${_rpcErr.message}) → switching to ${BACKUP_RPC}`);
-    Object.assign(connection, new Connection(BACKUP_RPC, { commitment: 'confirmed' }));
-  }
+  const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`);
 
   // Get wallet balance
   const pubkey = new PublicKey(WALLET);
@@ -2477,14 +1303,8 @@ async function main() {
 
   await loadMemory();
 
-  // Start real-time pump.fun launch detector (planetary scale feature)
-  startPumpLaunchSubscription(connection).catch(e =>
-    console.log(`⚠️  Launch subscription failed to start: ${e.message}`)
-  );
-
   console.log('\n' + '═'.repeat(50));
-  const _scale = getScaledLimits();
-  console.log(`🌍 SOL BOT v9.0 PLANETARY SCALE — ${_scale.label} | maxPos: ${_scale.maxPosSol.toFixed(4)} SOL | concurrent: ${_scale.maxConc}`);
+  console.log('🚀 SOL BOT v5.2 - Copy Trading + Quant Memory Engine');
   console.log('═'.repeat(50));
   console.log(`${PAPER_MODE ? '📝 PAPER MODE' : '💎 LIVE MODE — REAL MONEY'}`);
   console.log(`💰 Balance: ${portfolio.balance.toFixed(4)} SOL`);
@@ -2507,11 +1327,8 @@ async function main() {
     const time = new Date().toLocaleTimeString();
     console.log(`🔥 SCANNING... ${time}`);
 
-    // 1. Check SOL price (heartbeat) — cached 45s to reduce Birdeye calls
+    // 1. Check SOL price (heartbeat) — multi-source with fallback
     let solUsdPrice = null;
-    if (global._solPriceCache && Date.now() - global._solPriceCacheAt < 45000) {
-      solUsdPrice = global._solPriceCache;
-    }
     // Try Birdeye
     const solPriceData = await safeFetch(
       `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
@@ -2539,7 +1356,6 @@ async function main() {
       solUsdPrice = jupData?.data?.[SOL_MINT]?.price ? parseFloat(jupData.data[SOL_MINT].price) : null;
     }
     if (solUsdPrice && solUsdPrice > 10 && solUsdPrice < 1000) {
-      global._solPriceCache = solUsdPrice; global._solPriceCacheAt = Date.now();
       console.log(`   SOL: ${parseFloat(solUsdPrice).toFixed(2)}`);
     } else {
       console.log(`   SOL: price unavailable from all sources`);
