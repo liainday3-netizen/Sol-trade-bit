@@ -1132,13 +1132,18 @@ async function monitorCopyWallets(connection) {
 
             // Skip TXs not signed by the KOL (e.g. spam ATA creation by bots)
             // Note: KOL may use a trading terminal — fee payer can differ, but they must still SIGN
+            // OR be the fee payer (primary account)
             const accountKeys = txDetail?.transaction?.message?.accountKeys || [];
+            const feePayer = accountKeys[0]?.pubkey?.toString();
             const kolIsSigner = accountKeys.some(
               k => k.pubkey.toString() === walletAddr && k.signer === true
             );
-            if (!kolIsSigner) {
-              console.log(`   ⏭️  Skipping TX — KOL did not sign (likely spam/ATA creation)`);
+            const kolIsFeePayer = feePayer === walletAddr;
+            
+            if (!kolIsSigner && !kolIsFeePayer) {
+              console.log(`   ⏭️  Skipping TX — KOL not signer/fee-payer (likely spam/ATA creation)`);
               continue;
+            }
             }
 
             if (txDetail?.meta?.postTokenBalances && txDetail?.meta?.preTokenBalances) {
