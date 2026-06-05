@@ -778,6 +778,61 @@ async function buyPumpFunDirect(connection, tokenMint, solAmount) {
   }
 }
 
+// === SYNTHETIC QUOTE (DexScreener price fallback) ===
+// Builds a minimal quote-like object from a DexScreener price when Jupiter
+// has no route yet (e.g. brand-new Raydium pool not yet indexed).
+// Returns null if price cannot be determined.
+async function buildSyntheticQuote(tokenMint, solAmount, amountLamports) {
+  console.log(`   🔄 Building synthetic quote from DexScreener price...`);
+  try {
+    const dexData = await safeFetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`
+    );
+    if (!dexData?.pairs?.length) {
+      console.log(`   ❌ DexScreener: no pairs found for ${tokenMint.slice(0, 12)}`);
+      return null;
+    }
+    const priceUsd = parseFloat(dexData.pairs[0].priceUsd);
+    if (!priceUsd || priceUsd <= 0) {
+      console.log(`   ❌ DexScreener: invalid price for ${tokenMint.slice(0, 12)}`);
+      return null;
+    }
+    // Derive SOL price in USD from the pair's native currency if available,
+    // otherwise fall back to a rough estimate via a 1-SOL Jupiter probe.
+    let solPriceUsd = null;
+    try {
+      const solProbe = await safeFetch(
+        `https://api.dexscreener.com/latest/dex/tokens/${SOL_MINT}`
+      );
+      const solPair = solProbe?.pairs?.find(p => p.priceUsd);
+      if (solPair) solPriceUsd = parseFloat(solPair.priceUsd);
+    } catch (_) { /* ignore */ }
+
+    // Estimate tokens out: (solAmount * solPriceUsd) / priceUsd
+    let estimatedTokens = 0;
+    if (solPriceUsd && solPriceUsd > 0) {
+      estimatedTokens = (solAmount * solPriceUsd) / priceUsd;
+    }
+    const decimals = 6;
+    const outAmount = Math.floor(estimatedTokens * (10 ** decimals));
+
+    console.log(`   💡 Synthetic quote: ~${estimatedTokens.toFixed(2)} tokens @ ${priceUsd.toFixed(8)} (DexScreener)`);
+    return {
+      inputMint: SOL_MINT,
+      outputMint: tokenMint,
+      inAmount: amountLamports.toString(),
+      outAmount: outAmount.toString(),
+      outputDecimals: decimals,
+      priceUsd,          // extra field used below to skip price re-fetch
+      routePlan: [],     // empty — no Jupiter route
+      synthetic: true,   // flag so executeJupiterSwap is skipped
+    };
+  } catch (e) {
+    console.log(`   ❌ buildSyntheticQuote error: ${e.message}`);
+    return null;
+  }
+}
+
 async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWallets = new Set()) {
   // Safety capital scale: override any passed-in size with scaled amount
   {
@@ -885,28 +940,67 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       console.log(`   ⌛ Still not indexed (${waitMs / 1000}s)...`);
     }
     if (!quote) {
+      // Last resort: build a synthetic quote from DexScreener price so we can
+      // still record the position and execute via pump.fun / manual swap later.
+      console.log(`   ⚠️  Jupiter exhausted — attempting synthetic quote fallback...`);
+      quote = await buildSyntheticQuote(tokenMint, solAmount, amountLamports);
+    }
+    if (!quote) {
       console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
       return false;
     }
-    // quote found — fall through to Jupiter execution below
+    // quote found — fall through to execution below
   }
 
   const expectedOut = parseInt(quote.outAmount);
-  console.log(`   📊 Quote: ${expectedOut} tokens (route: ${quote.routePlan?.length || '?'} hops)`);
+  const routeLabel = quote.synthetic ? 'synthetic/DexScreener' : `${quote.routePlan?.length || '?'} hops`;
+  console.log(`   📊 Quote: ${expectedOut} tokens (route: ${routeLabel})`);
 
-  // Fetch price — derive from Jupiter quote if external APIs unavailable for this token
-  let price = await getTokenPrice(tokenMint);
+  // Fetch price — use DexScreener price embedded in synthetic quote, or derive from Jupiter
+  let price = quote.synthetic ? quote.priceUsd : await getTokenPrice(tokenMint);
   if (!price && expectedOut > 0) {
     const decimals = quote.outputDecimals || 6;
     price = solAmount / (expectedOut / (10 ** decimals));
-    console.log(`   ℹ️  Price derived from Jupiter quote: $${price.toFixed(10)}`);
+    console.log(`   ℹ️  Price derived from Jupiter quote: ${price.toFixed(10)}`);
   }
   if (!price) {
     console.log(`   ❌ Cannot determine price for ${symbol || tokenMint.slice(0, 8)}, skipping`);
     return false;
   }
 
-  const signature = await executeJupiterSwap(connection, quote);
+  let signature;
+  if (quote.synthetic) {
+    // No Jupiter route available — execute via pump.fun bonding curve as final attempt
+    console.log(`   🔄 Synthetic quote: attempting pump.fun bonding curve buy as execution path...`);
+    const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
+    if (pumpResult) {
+      signature = pumpResult.sig;
+      // Override price/amount with actual pump.fun result
+      price = pumpResult.price;
+      const _pfAgeH = null;
+      const _pfinfo = await getTokenInfo(tokenMint).catch(() => null);
+      const _pfRatio = (_pfinfo?.v24hUSD && _pfinfo?.liquidity) ? _pfinfo.v24hUSD / _pfinfo.liquidity : null;
+      positions.set(tokenMint, {
+        entryPrice: price,
+        highestPrice: price,
+        amount: pumpResult.tokensOut,
+        solInvested: solAmount,
+        entryTime: Date.now(),
+        symbol: symbol || tokenMint.slice(0, 8),
+        txSignature: signature,
+        meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: _pfRatio != null ? volLiqBracket(_pfRatio) : null, hourOfDay: new Date().getHours() },
+      });
+      portfolio.balance -= solAmount;
+      lastBuyTime = Date.now();
+      logTrade('📗 BUY (synthetic→pump.fun)', symbol || tokenMint.slice(0, 8), price);
+      console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${signature.slice(0, 16)}...`);
+      return true;
+    }
+    console.log(`   ❌ TRADE BLOCKED: Synthetic quote + pump.fun both failed for ${symbol || tokenMint.slice(0,12)}`);
+    return false;
+  }
+
+  signature = await executeJupiterSwap(connection, quote);
   if (!signature) {
     console.log(`   ❌ TRADE BLOCKED: Swap execution failed for ${symbol || tokenMint.slice(0,12)} — check TX error above`);
     return false;
@@ -1075,14 +1169,13 @@ async function monitorCopyWallets(connection) {
               maxSupportedTransactionVersion: 0,
             });
 
-            // Skip TXs not signed by the KOL (e.g. spam ATA creation by bots)
-            // Note: KOL may use a trading terminal — fee payer can differ, but they must still SIGN
+            // Skip TXs where KOL is not the fee payer (index 0).
+            // Trading terminals (Photon, BullX, etc.) use their own signers but the
+            // KOL wallet is always the fee payer / primary account.
             const accountKeys = txDetail?.transaction?.message?.accountKeys || [];
-            const kolIsSigner = accountKeys.some(
-              k => k.pubkey.toString() === walletAddr && k.signer === true
-            );
-            if (!kolIsSigner) {
-              console.log(`   ⏭️  Skipping TX — KOL did not sign (likely spam/ATA creation)`);
+            const feePayer = accountKeys[0]?.pubkey?.toString();
+            if (feePayer !== walletAddr) {
+              console.log(`   ⏭️  Skipping TX — KOL is not fee payer (fee payer: ${feePayer?.slice(0,8)})`);
               continue;
             }
 
