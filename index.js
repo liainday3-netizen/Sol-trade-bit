@@ -570,7 +570,7 @@ async function getTokenInfo(mintAddress) {
 // === JUPITER SWAP ENGINE (Core live trading logic) ===
 // ══════════════════════════════════════════════════════════════
 
-async function getJupiterQuote(inputMint, outputMint, amountLamports) {
+async function getJupiterQuote(inputMint, outputMint, amountLamports, retries = 0) {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
@@ -580,15 +580,63 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports) {
     asLegacyTransaction: 'false',
   });
 
-  const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
-  if (!quote) {
-    console.log('   ❌ Jupiter quote failed');
+  try {
+    const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
+    if (!quote) {
+      if (retries === 0) {
+        console.log('   ❌ Jupiter quote failed (token may not be indexed yet)');
+      }
+      return null;
+    }
+    if (quote.error) {
+      console.log(`   ❌ Jupiter error: ${quote.error}`);
+      return null;
+    }
+    return quote;
+  } catch (e) {
+    console.log(`   ❌ Jupiter quote exception: ${e.message}`);
     return null;
   }
-  return quote;
 }
 
 async function executeJupiterSwap(connection, quote) {
+// Build synthetic quote from DexScreener price when Jupiter is unavailable
+async function buildSyntheticQuote(inputMint, outputMint, amountLamports, tokenInfo) {
+  if (!tokenInfo || !tokenInfo.price) return null;
+  
+  try {
+    // Get SOL price
+    let solUsd = 85; // fallback
+    const solPrice = await safeFetch(
+      `https://public-api.birdeye.so/defi/price?address=${SOL_MINT}`,
+      { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
+    );
+    if (solPrice?.data?.value) solUsd = solPrice.data.value;
+    
+    const solAmount = amountLamports / LAMPORTS_PER_SOL;
+    const tokenAmount = (solAmount * solUsd) / tokenInfo.price;
+    const tokenDecimals = 6; // assume 6 decimals
+    const outAmount = Math.floor(tokenAmount * (10 ** tokenDecimals));
+    
+    console.log(`   💡 Built synthetic quote: ${outAmount} tokens @ $${tokenInfo.price.toFixed(8)}`);
+    
+    return {
+      inputMint,
+      outputMint,
+      inAmount: amountLamports.toString(),
+      outAmount: outAmount.toString(),
+      otherAmountThreshold: Math.floor(outAmount * 0.97).toString(), // 3% slippage
+      swapMode: 'ExactIn',
+      priceImpactPct: '0.5',
+      routePlan: [{ swapInfo: { ammKey: 'synthetic', label: 'DexScreener' } }],
+      outputDecimals: tokenDecimals,
+      inputDecimals: 9,
+    };
+  } catch (e) {
+    console.log(`   ❌ Synthetic quote failed: ${e.message}`);
+    return null;
+  }
+}
   if (!keypair) {
     console.log('   ❌ No keypair — cannot execute live swap');
     return null;
@@ -876,6 +924,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       return true;
     }
     // Bonding curve complete → token just migrated to Raydium; Jupiter pool not indexed yet.
+    // Bonding curve complete → token just migrated to Raydium; Jupiter pool not indexed yet.
     // Retry Jupiter with increasing delays to give the new pool time to appear.
     console.log(`   ⏳ Bonding curve migrated — retrying Jupiter (5s, 10s, 20s)...`);
     for (const waitMs of [5000, 10000, 20000]) {
@@ -885,8 +934,14 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       console.log(`   ⌛ Still not indexed (${waitMs / 1000}s)...`);
     }
     if (!quote) {
-      console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
-      return false;
+      // Jupiter still unavailable — try synthetic quote from DexScreener price
+      console.log(`   🔄 Jupiter unavailable, building synthetic quote from DexScreener...`);
+      const tokenInfo = await getTokenInfo(tokenMint);
+      quote = await buildSyntheticQuote(SOL_MINT, tokenMint, amountLamports, tokenInfo);
+      if (!quote) {
+        console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
+        return false;
+      }
     }
     // quote found — fall through to Jupiter execution below
   }
