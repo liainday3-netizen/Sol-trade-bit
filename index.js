@@ -4,6 +4,7 @@ import bs58 from 'bs58';
 
 // === CONFIG ===
 const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
@@ -11,6 +12,30 @@ const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is se
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
+
+// === RPC ENDPOINTS ===
+const RPC_ENDPOINTS = [
+  ...(HELIUS_KEY  ? [`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`]  : []),
+  ...(ALCHEMY_KEY ? [`https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`] : []),
+  'https://api.mainnet-beta.solana.com', // public fallback
+];
+
+async function createConnectionWithFallback() {
+  for (const endpoint of RPC_ENDPOINTS) {
+    try {
+      const conn = new Connection(endpoint, 'confirmed');
+      await conn.getSlot(); // verify connectivity
+      const label = endpoint.includes('helius')  ? 'Helius'
+                  : endpoint.includes('alchemy') ? 'Alchemy'
+                  : 'Public RPC';
+      console.log(`✅ RPC connected: ${label} (${endpoint.slice(0, 40)}...)`);
+      return conn;
+    } catch (e) {
+      console.log(`⚠️  RPC endpoint failed, trying next: ${endpoint.slice(0, 40)}... (${e.message})`);
+    }
+  }
+  throw new Error('All RPC endpoints failed — cannot start bot');
+}
 
 // === RISK MANAGEMENT ===
 const STOP_LOSS_PERCENT = 25;         // Sell if down 25%
@@ -447,14 +472,35 @@ if (PRIVATE_KEY) {
 }
 
 // === HELPERS ===
-async function safeFetch(url, options = {}) {
-  try {
-    const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    return null;
+
+// Exponential backoff retry for rate-limited HTTP calls (handles 429s)
+async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+      if (res.status === 429) {
+        if (i === maxRetries) {
+          console.log(`⚠️  Rate limited (429) after ${maxRetries} retries: ${url.slice(0, 60)}`);
+          return null;
+        }
+        const delay = Math.pow(2, i) * 1000 + Math.random() * 500;
+        console.log(`⏳ Rate limited (429) — retry ${i + 1}/${maxRetries} in ${(delay / 1000).toFixed(1)}s: ${url.slice(0, 60)}`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      if (i === maxRetries) return null;
+      const delay = Math.pow(2, i) * 1000 + Math.random() * 500;
+      await new Promise(r => setTimeout(r, delay));
+    }
   }
+  return null;
+}
+
+async function safeFetch(url, options = {}) {
+  return fetchWithRetry(url, options);
 }
 
 function logTrade(action, token, price, pnlPercent = null) {
@@ -1291,7 +1337,7 @@ function showStatus() {
 
 // === MAIN ===
 async function main() {
-  const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`);
+  const connection = await createConnectionWithFallback();
 
   // Get wallet balance
   const pubkey = new PublicKey(WALLET);
