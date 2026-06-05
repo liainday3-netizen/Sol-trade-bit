@@ -448,13 +448,21 @@ if (PRIVATE_KEY) {
 
 // === HELPERS ===
 async function safeFetch(url, options = {}) {
-  try {
-    const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    return null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
+      if (res.status === 429) {
+        const delay = 600 * Math.pow(2, attempt); // 600ms, 1.2s, 2.4s
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+    }
   }
+  return null;
 }
 
 function logTrade(action, token, price, pnlPercent = null) {
@@ -848,27 +856,39 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     // Jupiter failed after retry — fall back to pump.fun bonding curve direct buy
     console.log(`   🔄 Jupiter failed, trying pump.fun bonding curve direct...`);
     const pumpResult = await buyPumpFunDirect(connection, tokenMint, solAmount);
-    if (!pumpResult) {
+    if (pumpResult) {
+      // Record position from pump.fun buy
+      const _pfAgeH = null; // pump.fun token — age not available pre-graduation
+      positions.set(tokenMint, {
+        entryPrice: pumpResult.price,
+        highestPrice: pumpResult.price,
+        amount: pumpResult.tokensOut,
+        solInvested: solAmount,
+        entryTime: Date.now(),
+        symbol: symbol || tokenMint.slice(0, 8),
+        txSignature: pumpResult.sig,
+        meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: null, hourOfDay: new Date().getHours() },
+      });
+      portfolio.balance -= solAmount;
+      lastBuyTime = Date.now();
+      logTrade('📗 BUY (pump.fun)', symbol || tokenMint.slice(0, 8), pumpResult.price);
+      console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
+      return true;
+    }
+    // Bonding curve complete → token just migrated to Raydium; Jupiter pool not indexed yet.
+    // Retry Jupiter with increasing delays to give the new pool time to appear.
+    console.log(`   ⏳ Bonding curve migrated — retrying Jupiter (5s, 10s, 20s)...`);
+    for (const waitMs of [5000, 10000, 20000]) {
+      await new Promise(r => setTimeout(r, waitMs));
+      quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+      if (quote) { console.log(`   ✅ Jupiter pool indexed after ${waitMs / 1000}s — executing swap`); break; }
+      console.log(`   ⌛ Still not indexed (${waitMs / 1000}s)...`);
+    }
+    if (!quote) {
       console.log(`   ❌ TRADE BLOCKED: All routes failed for ${symbol || tokenMint.slice(0,12)}`);
       return false;
     }
-    // Record position from pump.fun buy
-    const _pfAgeH = null; // pump.fun token — age not available pre-graduation
-    positions.set(tokenMint, {
-      entryPrice: pumpResult.price,
-      highestPrice: pumpResult.price,
-      amount: pumpResult.tokensOut,
-      solInvested: solAmount,
-      entryTime: Date.now(),
-      symbol: symbol || tokenMint.slice(0, 8),
-      txSignature: pumpResult.sig,
-      meta: { source: (triggeringWallets && triggeringWallets.length) ? 'kol' : 'scanner', ageBracket: '0-2h', volLiqBracket: null, hourOfDay: new Date().getHours() },
-    });
-    portfolio.balance -= solAmount;
-    lastBuyTime = Date.now();
-    logTrade('📗 BUY (pump.fun)', symbol || tokenMint.slice(0, 8), pumpResult.price);
-    console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
-    return true;
+    // quote found — fall through to Jupiter execution below
   }
 
   const expectedOut = parseInt(quote.outAmount);
