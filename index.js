@@ -3,7 +3,8 @@ import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction,
 import bs58 from 'bs58';
 
 // === CONFIG ===
-const HELIUS_KEY = process.env.HELIUS_API_KEY || '';
+const HELIUS_KEY  = process.env.HELIUS_API_KEY  || '';
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || '';
 const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
@@ -446,23 +447,60 @@ if (PRIVATE_KEY) {
   }
 }
 
+
+// === RPC ENDPOINTS ===
+const RPC_ENDPOINTS = [
+  ...(HELIUS_KEY  ? [`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`]  : []),
+  ...(ALCHEMY_KEY ? [`https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`] : []),
+  'https://api.mainnet-beta.solana.com', // public fallback
+];
+
+async function createConnectionWithFallback() {
+  for (const endpoint of RPC_ENDPOINTS) {
+    try {
+      const conn = new Connection(endpoint, 'confirmed');
+      await conn.getSlot(); // verify connectivity
+      const label = endpoint.includes('helius')  ? 'Helius'
+                  : endpoint.includes('alchemy') ? 'Alchemy'
+                  : 'Public RPC';
+      console.log(`✅ RPC connected: ${label} (${endpoint.slice(0, 40)}...)`);
+      return conn;
+    } catch (e) {
+      console.log(`⚠️  RPC endpoint failed, trying next: ${endpoint.slice(0, 40)}... (${e.message})`);
+    }
+  }
+  throw new Error('All RPC endpoints failed — cannot start bot');
+}
+
 // === HELPERS ===
-async function safeFetch(url, options = {}) {
-  for (let attempt = 0; attempt < 3; attempt++) {
+// Exponential backoff retry for rate-limited HTTP calls (handles 429s)
+async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let i = 0; i <= maxRetries; i++) {
     try {
       const res = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
       if (res.status === 429) {
-        const delay = 600 * Math.pow(2, attempt); // 600ms, 1.2s, 2.4s
+        if (i === maxRetries) {
+          console.log(`⚠️  Rate limited (429) after ${maxRetries} retries: ${url.slice(0, 60)}`);
+          return null;
+        }
+        const delay = Math.pow(2, i) * 1000 + Math.random() * 500;
+        console.log(`⏳ Rate limited (429) — retry ${i + 1}/${maxRetries} in ${(delay / 1000).toFixed(1)}s: ${url.slice(0, 60)}`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
       if (!res.ok) return null;
       return await res.json();
     } catch (e) {
-      if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+      if (i === maxRetries) return null;
+      const delay = Math.pow(2, i) * 1000 + Math.random() * 500;
+      await new Promise(r => setTimeout(r, delay));
     }
   }
   return null;
+}
+
+async function safeFetch(url, options = {}) {
+  return fetchWithRetry(url, options);
 }
 
 function logTrade(action, token, price, pnlPercent = null) {
@@ -1404,23 +1442,11 @@ function showStatus() {
 
 // === MAIN ===
 async function main() {
-  const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
-  const backupUrl  = 'https://api.mainnet-beta.solana.com';
-  let   connection = new Connection(heliusUrl);
+  const connection = await createConnectionWithFallback();
 
-  // Get wallet balance — fallback to public RPC on 429 or any failure
+  // Get wallet balance
   const pubkey = new PublicKey(WALLET);
-  let balance;
-  try {
-    balance = await connection.getBalance(pubkey);
-    console.log('✅ Helius RPC connected');
-  } catch (e) {
-    const is429 = e?.message?.includes('429') || e?.message?.includes('max usage');
-    console.warn(`⚠️  Helius RPC ${is429 ? 'rate-limited (429)' : 'unreachable'} — falling back to public RPC`);
-    connection = new Connection(backupUrl);
-    balance = await connection.getBalance(pubkey);
-    console.log('✅ Public RPC fallback connected');
-  }
+  const balance = await connection.getBalance(pubkey);
   portfolio.balance = balance / LAMPORTS_PER_SOL;
   portfolio.startingBalance = portfolio.balance;
   safetyState.dailyStartBalance = portfolio.balance;
