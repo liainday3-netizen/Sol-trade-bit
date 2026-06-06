@@ -1,4 +1,4 @@
-// SOL BOT v5.1 - Copy Trading + Jupiter Swap Execution + Risk Management
+// SOL BOT v5.2-AGGRESSIVE - Copy Trading + Jupiter Swap Execution + Risk Management
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -14,16 +14,16 @@ const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
 
 // === RISK MANAGEMENT ===
-const STOP_LOSS_PERCENT = 25;         // Sell if down 25%
-const TAKE_PROFIT_PERCENT = 100;      // Sell if up 100% (2x)
-const TRAILING_STOP_PERCENT = 15;     // Trail 15% below peak price
-const MAX_POSITION_SIZE_SOL = 0.02;   // Max SOL per trade
-const MAX_POSITIONS = 3;              // Max concurrent positions
+const STOP_LOSS_PERCENT = 15;         // Sell if down 25%
+const TAKE_PROFIT_PERCENT = 175;      // Sell if up 100% (2x)
+const TRAILING_STOP_PERCENT = 8;     // Trail 15% below peak price
+const MAX_POSITION_SIZE_SOL = 0.05;   // Max SOL per trade
+const MAX_POSITIONS = 7;              // Max concurrent positions
 const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
-const SCAN_INTERVAL = 30000;          // Scan for new tokens every 30s
+const SCAN_INTERVAL = 12000;          // Scan for new tokens every 30s
 const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
 const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
-const MIN_TRADE_COOLDOWN = 120000;    // Wait 2 min between buys (avoid churn)
+const MIN_TRADE_COOLDOWN = 30000;    // Wait 2 min between buys (avoid churn)
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
 // === SOLANA CONSTANTS ===
@@ -277,11 +277,11 @@ const candidateKols = new Map(); // wallet -> { hits, seenTokens }
 // === SAFETY CAPITAL SCALE ENGINE ===
 // ══════════════════════════════════════════════════════════════
 // Position size = balance × BASE_RISK_PCT, capped at hard limits
-const BASE_RISK_PCT    = 0.08;   // 8% of balance per trade (default)
-const MIN_POSITION_SOL = 0.008;  // Never trade less than this
-const MAX_POSITION_SOL = 0.05;   // Hard cap regardless of balance
-const DAILY_LOSS_LIMIT = 0.15;   // Halt if down 15% in a day
-const DRAWDOWN_LIMIT   = 0.30;   // Halt if balance < starting × 70%
+const BASE_RISK_PCT    = 0.20;   // 8% of balance per trade (default)
+const MIN_POSITION_SOL = 0.005;  // Never trade less than this
+const MAX_POSITION_SOL = 0.12;   // Hard cap regardless of balance
+const DAILY_LOSS_LIMIT = 0.35;   // Halt if down 15% in a day
+const DRAWDOWN_LIMIT   = 0.50;   // Halt if balance < starting × 70%
 const HALT_DURATION_MS = 3 * 60 * 60 * 1000; // 3-hour cooldown after halt
 
 function resetDailyCounterIfNeeded() {
