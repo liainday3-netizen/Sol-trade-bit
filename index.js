@@ -1474,9 +1474,9 @@ async function scanNewTokens(connection) {
     console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
     // FILTERS — fresh momentum only:
-    if (liq < 30000)      { console.log(`      ↳ skip: low liq`);        continue; }
+    if (liq < 10000)      { console.log(`      ↳ skip: low liq`);        continue; }
     if (vol24h < 50000)   { console.log(`      ↳ skip: low vol`);         continue; }
-    if (ageHours > 16)     { console.log(`      ↳ skip: too old`);         continue; }
+    if (ageHours > 48)     { console.log(`      ↳ skip: too old`);         continue; }
     if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
     if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
