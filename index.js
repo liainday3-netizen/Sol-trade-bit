@@ -1,4 +1,4 @@
-// SOL BOT v5.2-AGGRESSIVE - Copy Trading + Jupiter Swap Execution + Risk Management
+// SOL BOT v5.3-MOMENTUM-SYNC - Copy Trading + Jupiter Swap Execution + Risk Management
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -237,14 +237,66 @@ function quantifySignal(kolWallets, tokenInfo, source = 'kol') {
     }
   }
 
-  score = Math.max(0, Math.min(100, score));
+
+  // — Momentum sync (0-25 pts) — price velocity + buy pressure ──
+  if (tokenInfo) {
+    const ch5m  = tokenInfo.priceChange5mPercent  || 0;
+    const ch1h  = tokenInfo.priceChange1hPercent  || 0;
+    const ch6h  = tokenInfo.priceChange6hPercent  || 0;
+    const buys  = tokenInfo.buys1h  || 0;
+    const sells = tokenInfo.sells1h || 0;
+    const v1h   = tokenInfo.v1hUSD  || 0;
+    const v24h  = tokenInfo.v24hUSD || 1;
+
+    // Hard gate: skip falling-knife tokens (1h negative AND 5m still falling)
+    if (ch1h < -5 && ch5m < 0) {
+      score = 0;
+      reasons.push('MOMENTUM_BLOCK(falling-knife)');
+    } else {
+      let mPts = 0;
+
+      // 5m velocity: token is moving NOW
+      if      (ch5m > 20) mPts += 10;
+      else if (ch5m > 10) mPts += 7;
+      else if (ch5m > 5)  mPts += 5;
+      else if (ch5m > 0)  mPts += 2;
+      else                mPts -= 3;  // momentum losing steam
+
+      // 1h trend confirmation
+      if      (ch1h > 30) mPts += 8;
+      else if (ch1h > 15) mPts += 5;
+      else if (ch1h > 5)  mPts += 3;
+      else if (ch1h < 0)  mPts -= 4;
+
+      // Buy/sell pressure ratio
+      if (buys > 0 && sells >= 0) {
+        const bsr = buys / Math.max(buys + sells, 1);
+        if      (bsr > 0.75) mPts += 7;  // 75%+ buys = strong pressure
+        else if (bsr > 0.60) mPts += 4;
+        else if (bsr < 0.35) mPts -= 5;  // sell-dominated, skip
+        reasons.push(`BSR(${(bsr*100).toFixed(0)}%buys→${mPts > 0 ? '+' : ''}${mPts})`);
+      }
+
+      // 1h volume surge: is volume accelerating vs 24h baseline?
+      const surgeMul = (v1h * 24) / v24h;  // >1 = this hour running hotter than avg
+      if      (surgeMul > 4) mPts += 5;
+      else if (surgeMul > 2) mPts += 3;
+      else if (surgeMul > 1) mPts += 1;
+      reasons.push(`momentum(5m:${ch5m.toFixed(1)}% 1h:${ch1h.toFixed(1)}% surge:${surgeMul.toFixed(1)}x→${mPts}pts)`);
+
+      score += mPts;
+    }
+  }
+
+  score = Math.max(0, Math.min(135, score));  // expanded ceiling with momentum
 
   // Determine position multiplier
   let multiplier, action;
-  if (score >= 70)      { multiplier = 1.3; action = 'FULL+'; }
-  else if (score >= 50) { multiplier = 1.0; action = 'FULL';  }
-  else if (score >= 30) { multiplier = 0.7; action = 'HALF';  }
-  else                  { multiplier = 0;   action = 'SKIP';  }
+  if      (score >= 100) { multiplier = 1.5; action = 'BOOST'; }  // high momentum
+  else if (score >= 75)  { multiplier = 1.3; action = 'FULL+'; }
+  else if (score >= 55)  { multiplier = 1.0; action = 'FULL';  }
+  else if (score >= 35)  { multiplier = 0.7; action = 'HALF';  }
+  else                   { multiplier = 0;   action = 'SKIP';  }
 
   console.log(`   📐 QUANT SCORE: ${score}/100 [${reasons.join(' | ')}] → ${action} (${multiplier}x)`);
   return { score, multiplier, action };
@@ -503,6 +555,60 @@ async function safeFetch(url, options = {}) {
   return fetchWithRetry(url, options);
 }
 
+
+// ══════════════════════════════════════════════════════════════
+// === RATE-LIMIT GUARD — Birdeye: 1 RPS / 30K CUs ===
+// ══════════════════════════════════════════════════════════════
+const BIRDEYE_RPS        = 1;          // Standard plan: 1 req/s
+const BIRDEYE_MIN_GAP_MS = 1100;       // 10% headroom over 1000ms
+const PRICE_CACHE_TTL_MS = 8000;       // Reuse price for 8s per mint
+
+const _birdeyeQueue   = [];            // pending { url, opts, resolve, reject }
+let   _birdeyeBusy    = false;
+const _priceCache     = new Map();     // mint → { price, ts }
+
+function birdeyeFetch(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    _birdeyeQueue.push({ url, options, resolve, reject });
+    _drainBirdeyeQueue();
+  });
+}
+
+async function _drainBirdeyeQueue() {
+  if (_birdeyeBusy || _birdeyeQueue.length === 0) return;
+  _birdeyeBusy = true;
+  while (_birdeyeQueue.length > 0) {
+    const { url, options, resolve, reject } = _birdeyeQueue.shift();
+    const t0 = Date.now();
+    try {
+      const data = await safeFetch(url, options);
+      resolve(data);
+    } catch (e) {
+      reject(e);
+    }
+    const elapsed = Date.now() - t0;
+    const wait = Math.max(0, BIRDEYE_MIN_GAP_MS - elapsed);
+    if (wait > 0 && _birdeyeQueue.length > 0) await new Promise(r => setTimeout(r, wait));
+  }
+  _birdeyeBusy = false;
+}
+
+function getCachedPrice(mint) {
+  const entry = _priceCache.get(mint);
+  if (entry && Date.now() - entry.ts < PRICE_CACHE_TTL_MS) return entry.price;
+  return null;
+}
+
+function setCachedPrice(mint, price) {
+  _priceCache.set(mint, { price, ts: Date.now() });
+}
+
+// Stagger whale wallet polls so all 10 don't fire simultaneously
+// Returns a promise that resolves after (index × 800ms) delay
+function staggerDelay(index) {
+  return new Promise(r => setTimeout(r, index * 800));
+}
+
 function logTrade(action, token, price, pnlPercent = null) {
   const time = new Date().toLocaleTimeString();
   const pnlStr = pnlPercent !== null ? ` (${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)` : '';
@@ -513,12 +619,19 @@ function logTrade(action, token, price, pnlPercent = null) {
 
 // === PRICE FETCHING ===
 async function getTokenPrice(mintAddress) {
-  // Try Birdeye first
-  const data = await safeFetch(
+  // Check cache first (avoids redundant Birdeye calls within TTL)
+  const cached = getCachedPrice(mintAddress);
+  if (cached !== null) return cached;
+
+  // Rate-limited Birdeye fetch
+  const data = await birdeyeFetch(
     `https://public-api.birdeye.so/defi/price?address=${mintAddress}`,
     { headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' } }
   );
-  if (data?.data?.value) return data.data.value;
+  if (data?.data?.value) {
+    setCachedPrice(mintAddress, data.data.value);
+    return data.data.value;
+  }
 
   // Fallback 2: DexScreener (indexes Pump.fun/Raydium pools faster)
   try {
@@ -597,6 +710,11 @@ async function getTokenInfo(mintAddress) {
     v24hUSD:              best.volume?.h24 || 0,
     priceChange24hPercent: best.priceChange?.h24 || 0,
     priceChange1hPercent:  best.priceChange?.h1 || 0,
+    priceChange5mPercent:  best.priceChange?.m5  || 0,
+    priceChange6hPercent:  best.priceChange?.h6  || 0,
+    buys1h:   best.txns?.h1?.buys  || 0,
+    sells1h:  best.txns?.h1?.sells || 0,
+    v1hUSD:   best.volume?.h1 || 0,
     createdAt,
     marketCap:            best.marketCap || 0,
     fdv:                  best.fdv || 0,
