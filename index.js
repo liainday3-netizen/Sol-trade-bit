@@ -14,15 +14,15 @@ const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
 
 // === RISK MANAGEMENT ===
-const STOP_LOSS_PERCENT = 15;         // Sell if down 25%
-const TAKE_PROFIT_PERCENT = 175;      // Sell if up 100% (2x)
-const TRAILING_STOP_PERCENT = 8;     // Trail 15% below peak price
+const STOP_LOSS_PERCENT = 20;         // Sell if down 20% — wider room for meme coin volatility
+const TAKE_PROFIT_PERCENT = 60;       // Sell if up 60% — realistic fast exit on pump-dump cycles
+const TRAILING_STOP_PERCENT = 15;    // Trail 15% below peak — avoids wick-triggered exits
 const MAX_POSITION_SIZE_SOL = 0.05;   // Max SOL per trade
 const MAX_POSITIONS = 7;              // Max concurrent positions
 const PRICE_CHECK_INTERVAL = 5000;    // Check prices every 5s
 const SCAN_INTERVAL = 12000;          // Scan for new tokens every 30s
-const SLIPPAGE_BPS = 300;             // 3% slippage tolerance
-const PRIORITY_FEE_LAMPORTS = 50000;  // Priority fee for faster inclusion
+const SLIPPAGE_BPS = 500;             // 5% slippage — needed for hot token fast fills
+const PRIORITY_FEE_LAMPORTS = 200000; // Higher priority for congested network
 const MIN_TRADE_COOLDOWN = 30000;    // Wait 2 min between buys (avoid churn)
 const MIN_BALANCE_RESERVE = 0.01;     // Keep 0.01 SOL as gas reserve
 
@@ -1475,10 +1475,10 @@ async function scanNewTokens(connection) {
 
     // FILTERS — fresh momentum only:
     if (liq < 10000)      { console.log(`      ↳ skip: low liq`);        continue; }
-    if (vol24h < 50000)   { console.log(`      ↳ skip: low vol`);         continue; }
+    if (vol24h < 25000)   { console.log(`      ↳ skip: low vol`);         continue; }
     if (ageHours > 48)     { console.log(`      ↳ skip: too old`);         continue; }
     if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
-    if (volLiqRatio < 1)  { console.log(`      ↳ skip: low turnover`);    continue; }
+    if (volLiqRatio < 2)  { console.log(`      ↳ skip: low turnover`);    continue; }
 
     const { multiplier: _sqMul, action: _sqAct } = quantifySignal([], info, 'scanner');
     //if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
