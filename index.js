@@ -760,7 +760,7 @@ async function getJupiterQuote(inputMint, outputMint, amountLamports) {
     amount: amountLamports.toString(),
     slippageBps: SLIPPAGE_BPS.toString(),
     onlyDirectRoutes: 'false',
-    asLegacyTransaction: 'false',
+    maxAccounts: '64',          // prevents 'too many accounts' on complex routes
   });
 
   const quote = await safeFetch(`${JUPITER_QUOTE_URL}?${params}`);
@@ -785,7 +785,7 @@ async function executeJupiterSwap(connection, quote) {
       quoteResponse: quote,
       userPublicKey: keypair.publicKey.toString(),
       wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: PRIORITY_FEE_LAMPORTS,
+      priorityFeeLamports: PRIORITY_FEE_LAMPORTS,        // total lamports (was: computeUnitPriceMicroLamports)
       dynamicComputeUnitLimit: true,
     }),
   });
@@ -799,15 +799,22 @@ async function executeJupiterSwap(connection, quote) {
     // Deserialize, sign, and send
     const txBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(txBuf);
+
+    // Anchor confirmation to latest blockhash (avoids timeout on busy network)
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    transaction.message.recentBlockhash = blockhash;
     transaction.sign([keypair]);
 
     const signature = await connection.sendRawTransaction(transaction.serialize(), {
-      skipPreflight: true,
+      skipPreflight: false,    // run simulation — catch errors before burning fees
       maxRetries: 3,
     });
 
-    // Confirm transaction
-    const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+    // Confirm with blockhash anchor (reliable even on congested network)
+    const confirmation = await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed'
+    );
     if (confirmation.value.err) {
       console.log(`   ❌ TX failed: ${JSON.stringify(confirmation.value.err)}`);
       return null;
