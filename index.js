@@ -1,4 +1,4 @@
-// SOL BOT v5.3-MOMENTUM-SYNC - Copy Trading + Jupiter Swap Execution + Risk Management
+// SOL BOT v5.4-FIXED - Copy Trading + Jupiter Swap Execution + Risk Management
 import { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -9,6 +9,7 @@ const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY || '';
 const WALLET = process.env.WALLET_ADDRESS || 'E9gq4noFD4PwWz3DFwmvZCFxHTTknC55gu7Uh351Yd6m';
 const PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY || ''; // Base58 encoded private key
 const PAPER_MODE = !PRIVATE_KEY; // Auto-enable live mode when private key is set
+const LIVE_UNLOCK_USD = 10;  // Switch to live when paper balance × SOL price ≥ $10 (user request)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const GITHUB_REPO  = 'liainday3-netizen/Sol-trade-bit';
 const MEMORY_FILE  = 'memory.json';
@@ -486,6 +487,32 @@ async function discoverEarlyBuyers(connection, tokenMint, entryTime) {
     }
   } catch (e) { /* discovery is best-effort */ }
 }        // Execute on single KOL signal (only Jijo is active)
+
+// ══════════════════════════════════════════════════════════════
+// === JUPITER FAIL BLACKLIST — skip repeatedly unindexed tokens ===
+// ══════════════════════════════════════════════════════════════
+const _jupFails       = new Map();   // mint → { count, blockedUntil }
+const JUP_MAX_TRIES   = 2;           // give up after 2 total Jupiter failures
+const JUP_BLOCK_MS    = 5 * 60 * 1000; // 5-min cooldown before retrying a blacklisted mint
+
+function isJupBlocked(mint) {
+  const e = _jupFails.get(mint);
+  if (!e) return false;
+  if (e.blockedUntil && Date.now() < e.blockedUntil) return true;
+  if (e.blockedUntil && Date.now() >= e.blockedUntil) { _jupFails.delete(mint); return false; }
+  return false;
+}
+
+function recordJupFail(mint) {
+  const e = _jupFails.get(mint) || { count: 0 };
+  e.count += 1;
+  if (e.count >= JUP_MAX_TRIES) {
+    e.blockedUntil = Date.now() + JUP_BLOCK_MS;
+    console.log(`   🚫 Jupiter blacklist: ${mint.slice(0,10)} (${e.count} fails → 5min cooldown)`);
+  }
+  _jupFails.set(mint, e);
+}
+
 const CONSENSUS_WINDOW = 300000;      // Within 5 minutes of each other
 
 // === WALLET KEYPAIR (for live trading) ===
@@ -1052,6 +1079,12 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
     return true;
   }
 
+  // === JUPITER BLACKLIST CHECK ===
+  if (isJupBlocked(tokenMint)) {
+    console.log(`   🚫 Skipping ${symbol || tokenMint.slice(0,10)}: Jupiter blacklisted (retrying later)`);
+    return false;
+  }
+
   // === LIVE TRADE ===
   // Attempt Jupiter quote unconditionally — new tokens may not have DexScreener/Birdeye
   // data yet, so we don't gate on price availability upfront.
@@ -1059,6 +1092,7 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
   let quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
   if (!quote) {
     // Retry once after 3s — brand new pools take a moment to be indexed by Jupiter
+    recordJupFail(tokenMint);
     console.log(`   ⏳ Quote failed, retrying in 3s (new pool may still be indexing)...`);
     await new Promise(r => setTimeout(r, 3000));
     quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
@@ -1086,15 +1120,16 @@ async function buyToken(connection, tokenMint, solAmount, symbol, triggeringWall
       console.log(`   └─ Invested: ${solAmount.toFixed(4)} SOL | TX: ${pumpResult.sig.slice(0, 16)}...`);
       return true;
     }
-    // Bonding curve complete → token just migrated to Raydium; Jupiter pool not indexed yet.
-    // Retry Jupiter with increasing delays to give the new pool time to appear.
-    console.log(`   ⏳ Bonding curve migrated — retrying Jupiter (5s, 10s, 20s)...`);
-    for (const waitMs of [5000, 10000, 20000]) {
-      await new Promise(r => setTimeout(r, waitMs));
-      quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
-      if (quote) { console.log(`   ✅ Jupiter pool indexed after ${waitMs / 1000}s — executing swap`); break; }
-      console.log(`   ⌛ Still not indexed (${waitMs / 1000}s)...`);
+    // Bonding curve migrated → pool may need a moment. One quick retry then blacklist.
+    recordJupFail(tokenMint);
+    if (isJupBlocked(tokenMint)) {
+      console.log(`   ⏭️  Bonding curve migrated but Jupiter not ready — blacklisted for 5min, skipping`);
+      return false;
     }
+    console.log(`   ⏳ Bonding curve migrated — one final Jupiter retry (8s)...`);
+    await new Promise(r => setTimeout(r, 8000));
+    quote = await getJupiterQuote(SOL_MINT, tokenMint, amountLamports);
+    if (!quote) { recordJupFail(tokenMint); }
     if (!quote) {
       // Last resort: build a synthetic quote from DexScreener price so we can
       // still record the position and execute via pump.fun / manual swap later.
@@ -1474,11 +1509,11 @@ async function scanNewTokens(connection) {
     console.log(`   └─ ${symbol} | $${info.price.toFixed(8)} | Liq: $${liq.toLocaleString()} | Age: ${ageHours.toFixed(1)}h | Vol: $${vol24h.toLocaleString()} | Chg1h: ${chg1h > 0 ? '+' : ''}${chg1h.toFixed(1)}% | V/L: ${volLiqRatio.toFixed(1)}`);
 
     // FILTERS — fresh momentum only:
-    if (liq < 10000)      { console.log(`      ↳ skip: low liq`);        continue; }
-    if (vol24h < 25000)   { console.log(`      ↳ skip: low vol`);         continue; }
-    if (ageHours > 48)     { console.log(`      ↳ skip: too old`);         continue; }
-    if (chg1h <= 0)       { console.log(`      ↳ skip: not trending up`); continue; }
-    if (volLiqRatio < 2)  { console.log(`      ↳ skip: low turnover`);    continue; }
+    if (liq < 2000)       { console.log(`      ↳ skip: low liq`);        continue; }
+    if (vol24h < 3000)    { console.log(`      ↳ skip: low vol`);         continue; }
+    if (ageHours > 96)     { console.log(`      ↳ skip: too old`);         continue; }
+    if (chg1h < -15)      { console.log(`      ↳ skip: strong downtrend`); continue; }
+    if (volLiqRatio < 0.3){ console.log(`      ↳ skip: low turnover`);    continue; }
 
     const { multiplier: _sqMul, action: _sqAct } = quantifySignal([], info, 'scanner');
     //if (_sqAct === 'SKIP') { console.log(`   ⏭️  QUANT: scanner signal skipped`); continue; }
@@ -1540,6 +1575,9 @@ async function monitorPositions(connection) {
 // === STATUS DISPLAY ===
 function showStatus() {
   console.log(`\n${'═'.repeat(50)}`);
+  if (PAPER_MODE && solUsdPrice && portfolio.balance * solUsdPrice >= LIVE_UNLOCK_USD) {
+    console.log(`\n  🟢 LIVE READY: paper balance $${(portfolio.balance * solUsdPrice).toFixed(2)} ≥ $${LIVE_UNLOCK_USD} — set WALLET_PRIVATE_KEY to go live!`);
+  }
   console.log(`${PAPER_MODE ? '📝 PAPER' : '💎 LIVE'} | 💰 ${portfolio.balance.toFixed(4)} SOL | Pos: ${positions.size}/${MAX_POSITIONS} | PnL: ${portfolio.totalPnl > 0 ? '+' : ''}${portfolio.totalPnl.toFixed(4)} SOL`);
   if (kolScores.size > 0) {
     const sorted = [...kolScores.entries()].sort((a,b) => (b[1].wins/b[1].trades) - (a[1].wins/a[1].trades));
