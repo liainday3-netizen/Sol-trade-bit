@@ -2,27 +2,20 @@
  * mev-defense.js
  * --------------
  * Inline MEV defense for Sol-trade-bit.
- * Tuned for meme coin copy trading (high slippage tolerance, small positions).
+ * Loosened for active meme-coin trading — only abort on extreme risk.
  *
- * Add to executeJupiterSwap() BEFORE the Jupiter POST:
- *
- *   const mevCheck = mevDefense.inspect({
- *     inputMint, outputMint,
- *     amountIn: solAmountUsd,
- *     slippageBps: SLIPPAGE_BPS,
- *     priorityFeeLamports: PRIORITY_FEE_LAMPORTS,
- *   });
- *   if (mevCheck.recommendation === 'abort') { return null; }
- *   const effectiveFee = mevCheck.recommendation === 'reorder'
- *     ? Math.max(PRIORITY_FEE_LAMPORTS, 400_000)
- *     : PRIORITY_FEE_LAMPORTS;
+ * Risk thresholds (loosened):
+ *   SANDWICH_RISK_THRESHOLD 0.65 → 0.85 (only abort when truly dangerous)
+ *   abort cutoff             0.80 → 0.90 (reorder on moderate risk, abort only on extreme)
+ *   LARGE_ORDER_USD          200  → 500  (small meme positions rarely attract bots)
+ *   rapid-repeat cooldown    2s   → 500ms (allow faster consecutive fills)
  */
 
 const CONFIG = {
-  MAX_SLIPPAGE_BPS:        800,    // flag above 8% as high-risk
-  MIN_PRIORITY_FEE:        50_000, // lamports
-  LARGE_ORDER_USD:         200,    // flag USD trade size above this
-  SANDWICH_RISK_THRESHOLD: 0.65,
+  MAX_SLIPPAGE_BPS:        1000,   // flag above 10% (meme coins regularly need 5-8%)
+  MIN_PRIORITY_FEE:        10_000, // lamports — bot uses 200k, this gate won't trigger
+  LARGE_ORDER_USD:         500,    // only flag large orders that attract real bots
+  SANDWICH_RISK_THRESHOLD: 0.85,   // abort threshold raised — let more trades through
 };
 
 const _recentOrders = new Map();
@@ -47,11 +40,11 @@ export const mevDefense = {
       riskScore += 0.3;
     }
 
-    // Rapid-repeat guard — same token pair within 2s
+    // Rapid-repeat guard — same token pair within 500ms (loosened from 2s)
     const now = Date.now();
     const key = `${order.inputMint}:${order.outputMint}`;
     const last = _recentOrders.get(key);
-    if (last && (now - last) < 2000) {
+    if (last && (now - last) < 500) {
       flags.push('RAPID_REPEAT');
       riskScore += 0.2;
     }
@@ -61,10 +54,11 @@ export const mevDefense = {
     }
 
     const safe = riskScore < CONFIG.SANDWICH_RISK_THRESHOLD;
-    const recommendation = riskScore >= 0.8 ? 'abort' : riskScore >= 0.5 ? 'reorder' : 'proceed';
+    // abort only at 0.9+; reorder between 0.6–0.9
+    const recommendation = riskScore >= 0.9 ? 'abort' : riskScore >= 0.6 ? 'reorder' : 'proceed';
 
     if (flags.length > 0) {
-      console.log(`\ud83d\udee1\ufe0f  [MEV] score=${riskScore.toFixed(2)} [${recommendation.toUpperCase()}]: ${flags.join(', ')}`);
+      console.log(`\u{1F6E1}\uFE0F  [MEV] score=${riskScore.toFixed(2)} [${recommendation.toUpperCase()}]: ${flags.join(', ')}`);
     }
 
     return { safe, riskScore, flags, recommendation };
