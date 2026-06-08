@@ -4,21 +4,27 @@
  * Real strategy implementations for meme-coin copy trading.
  *
  * Strategies:
- *   1. MomentumStrategy  — price velocity + volume acceleration
+ *   1. MomentumStrategy    — price velocity + volume acceleration
  *   2. VolumeSpikeStrategy — sudden 24h volume relative to market cap
- *   3. CopyTradeStrategy  — KOL wallet signal follower
+ *   3. CopyTradeStrategy   — KOL wallet signal follower
  *
  * Each implements StrategyScorer and returns a StrategyScore.
  * AIPlane.evaluate() runs all strategies in parallel and fans results
  * to GlobalControlPlane.routeAIScores() via AISignalBridge.
+ *
+ * AIPlane.evolve() now wired to a real UCB1 RLFeedbackLoop:
+ *   - Records trade P&L per strategy after each settled order
+ *   - Adjusts confidence weights dynamically based on historical performance
+ *   - Best-performing strategy converges toward higher scores over time
  */
 
-import { StrategyScore } from "./AISignalBridge";
+import { StrategyScore }                  from "./AISignalBridge";
+import { RLFeedbackLoop, type ArmStats }  from "./RLFeedbackLoop";
 
-const SOL_MINT   = "So11111111111111111111111111111111111111112";
+const SOL_MINT    = "So11111111111111111111111111111111111111112";
 const BIRDEYE_BASE = "https://public-api.birdeye.so";
 
-// ── BirdEye fetch helper ─────────────────────────────────────────────────────
+// ── BirdEye fetch helper ──────────────────────────────────────────────────────
 async function birdeyeGet<T>(path: string, apiKey: string): Promise<T | null> {
   try {
     const res = await fetch(`${BIRDEYE_BASE}${path}`, {
@@ -38,14 +44,14 @@ async function birdeyeGet<T>(path: string, apiKey: string): Promise<T | null> {
 
 // ── Shared interfaces ─────────────────────────────────────────────────────────
 interface TokenOverview {
-  address:      string;
-  price:        number;
-  priceChange1hPercent: number;
-  priceChange24hPercent: number;
-  v24hUSD:      number;   // 24h volume USD
-  mc:           number;   // market cap USD
-  liquidity:    number;
-  holder:       number;
+  address:                  string;
+  price:                    number;
+  priceChange1hPercent:     number;
+  priceChange24hPercent:    number;
+  v24hUSD:                  number;  // 24h volume USD
+  mc:                       number;  // market cap USD
+  liquidity:                number;
+  holder:                   number;
 }
 
 interface StrategyScorer {
@@ -87,18 +93,18 @@ class MomentumStrategy implements StrategyScorer {
     const suggestedAmountUSD = 7.50 * confidence;
 
     return {
-      strategy: this.name,
-      score:    confidence,
+      strategy:         this.name,
+      score:            confidence,
       signal,
-      inputMint:  signal === "BUY" ? SOL_MINT : token.address,
-      outputMint: signal === "BUY" ? token.address : SOL_MINT,
+      inputMint:        signal === "BUY" ? SOL_MINT : token.address,
+      outputMint:       signal === "BUY" ? token.address : SOL_MINT,
       suggestedAmountUSD,
-      metadata:   { h1, h24, vol, price },
+      metadata:         { h1, h24, vol, price },
     };
   }
 }
 
-// ── Strategy 2: Volume Spike ───────────────────────────────────────────────────
+// ── Strategy 2: Volume Spike ──────────────────────────────────────────────────
 /**
  * Fires BUY when volume/mcap ratio spikes above 2×, indicating unusual activity.
  * Classic "smart money" entry signal for early meme-coin pumps.
@@ -121,13 +127,13 @@ class VolumeSpikeStrategy implements StrategyScorer {
     if (h1 < -5) return null;
 
     return {
-      strategy: this.name,
-      score:    confidence,
-      signal:   "BUY",
-      inputMint:  SOL_MINT,
-      outputMint: token.address,
+      strategy:         this.name,
+      score:            confidence,
+      signal:           "BUY",
+      inputMint:        SOL_MINT,
+      outputMint:       token.address,
       suggestedAmountUSD: 7.50 * confidence,
-      metadata:   { ratio: ratio.toFixed(2), vol, mc },
+      metadata:         { ratio: ratio.toFixed(2), vol, mc },
     };
   }
 }
@@ -140,7 +146,7 @@ class VolumeSpikeStrategy implements StrategyScorer {
 class CopyTradeStrategy implements StrategyScorer {
   name = "CopyTrade";
   private kolWallets: string[];
-  private apiKey: string;
+  private apiKey:     string;
 
   constructor(kolWallets: string[], apiKey: string) {
     this.kolWallets = kolWallets;
@@ -152,7 +158,12 @@ class CopyTradeStrategy implements StrategyScorer {
     const since = now - 120; // last 2 minutes
 
     for (const wallet of this.kolWallets) {
-      const txs = await birdeyeGet<{ items: Array<{ from: string; to: string; txHash: string; blockUnixTime: number; side: string; tokenAddress: string }> }>(
+      const txs = await birdeyeGet<{
+        items: Array<{
+          from: string; to: string; txHash: string;
+          blockUnixTime: number; side: string; tokenAddress: string
+        }>
+      }>(
         `/v1/wallet/tx_list?wallet=${wallet}&limit=10`,
         apiKey,
       );
@@ -169,13 +180,13 @@ class CopyTradeStrategy implements StrategyScorer {
         // Confidence boost: 0.75 base — KOL signal is high-quality but not perfect
         const confidence = 0.78;
         return {
-          strategy: this.name,
-          score:    confidence,
-          signal:   "BUY",
-          inputMint:  SOL_MINT,
-          outputMint: token.address,
+          strategy:         this.name,
+          score:            confidence,
+          signal:           "BUY",
+          inputMint:        SOL_MINT,
+          outputMint:       token.address,
           suggestedAmountUSD: 7.50 * confidence,
-          metadata:   { kol: wallet, txHash: recentBuy.txHash },
+          metadata:         { kol: wallet, txHash: recentBuy.txHash },
         };
       }
     }
@@ -193,10 +204,15 @@ export interface AIPlaneConfig {
 
 export class AIPlane {
   private strategies: StrategyScorer[];
-  private config: AIPlaneConfig;
+  private config:     AIPlaneConfig;
+  private rl:         RLFeedbackLoop;
 
   constructor(config: AIPlaneConfig) {
     this.config = config;
+
+    const strategyNames = ["Momentum", "VolumeSpike", "CopyTrade"];
+    this.rl = new RLFeedbackLoop(strategyNames);
+
     this.strategies = [
       new MomentumStrategy(),
       new VolumeSpikeStrategy(),
@@ -206,10 +222,11 @@ export class AIPlane {
 
   /**
    * Run all strategies against all watched tokens.
+   * Applies RL-derived confidence weights before returning.
    * Returns all qualifying StrategyScores — caller sends to AISignalBridge.
    */
   async evaluate(): Promise<StrategyScore[]> {
-    const results: StrategyScore[] = [];
+    const raw: StrategyScore[] = [];
 
     await Promise.allSettled(
       this.config.watchList.map(async (tokenAddress) => {
@@ -220,7 +237,7 @@ export class AIPlane {
           this.strategies.map(async (strategy) => {
             try {
               const s = await strategy.score(overview, this.config.birdeyeApiKey);
-              if (s) results.push(s);
+              if (s) raw.push(s);
             } catch (e) {
               console.warn(`[AIPlane] ${strategy.name} error for ${tokenAddress}:`, e);
             }
@@ -228,6 +245,23 @@ export class AIPlane {
         );
       }),
     );
+
+    // Apply RL weights — scales confidence scores by each strategy's UCB-derived weight
+    const weights = this.rl.getWeights();
+    const results = raw.map(s => {
+      const w = weights.get(s.strategy) ?? 1.0;
+      return { ...s, score: Math.min(s.score * w, 0.99) };
+    });
+
+    if (results.length > 0) {
+      const weightStr = [...weights.entries()]
+        .map(([name, w]) => `${name}=${w.toFixed(2)}`)
+        .join(", ");
+      console.log(
+        `[AIPlane] ${results.length} signal(s) from ${this.config.watchList.length} tokens` +
+        ` | RL weights: [${weightStr}]`,
+      );
+    }
 
     return results;
   }
@@ -244,11 +278,27 @@ export class AIPlane {
 
   /**
    * Feedback from ExecutionNode via AISignalBridge.
-   * Placeholder for future RL loop — track strategy P&L here.
+   * Updates the UCB1 multi-armed bandit with the realized P&L.
+   *
+   * @param strategyName - Which strategy generated the signal
+   * @param outcome      - "success" | "failure" | "aborted"
+   * @param pnlPercent   - Realized P&L in % (required for success/failure; 0 for aborted)
    */
-  evolve(strategyName: string, outcome: "success" | "failure" | "aborted"): void {
-    console.log(`[AIPlane] Feedback: ${strategyName} → ${outcome} (RL hook ready)`);
-    // TODO: update strategy weights / confidence thresholds based on realized P&L
+  evolve(
+    strategyName: string,
+    outcome:      "success" | "failure" | "aborted",
+    pnlPercent    = 0,
+  ): void {
+    const aborted = outcome === "aborted";
+    const pnl     = aborted ? 0 : outcome === "success" ? Math.abs(pnlPercent) : -Math.abs(pnlPercent);
+
+    this.rl.record(strategyName, pnl, aborted);
+
+    // Log a summary of best-performing strategy
+    const recommended = this.rl.recommendedStrategy();
+    if (recommended) {
+      console.log(`[AIPlane] RL update complete. Current best arm: ${recommended}`);
+    }
   }
 
   /**
@@ -261,7 +311,22 @@ export class AIPlane {
     }
   }
 
-  // ── Private ─────────────────────────────────────────────────────────────────
+  /** Returns RL arm stats — for observability/dashboard */
+  getRLStats(): ArmStats[] {
+    return this.rl.getStats();
+  }
+
+  /** Serialize RL state to disk for persistence across restarts */
+  serializeRL(): object {
+    return this.rl.serialize();
+  }
+
+  /** Restore RL state from a previous session */
+  restoreRL(snapshot: Parameters<RLFeedbackLoop["restore"]>[0]): void {
+    this.rl.restore(snapshot);
+  }
+
+  // ── Private ──────────────────────────────────────────────────────────────────
 
   private async fetchOverview(tokenAddress: string): Promise<TokenOverview | null> {
     const data = await birdeyeGet<TokenOverview>(
