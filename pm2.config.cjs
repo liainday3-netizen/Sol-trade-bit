@@ -1,10 +1,10 @@
 /**
- * pm2.config.js
+ * pm2.config.cjs
  * -------------
  * PM2 ecosystem config for the Solana multi-plane trading bot.
  *
  * Usage:
- *   pm2 start pm2.config.js          # start
+ *   pm2 start pm2.config.cjs          # start
  *   pm2 restart sol-bot               # restart
  *   pm2 logs sol-bot                  # tail logs
  *   pm2 monit                         # live CPU/RAM/log dashboard
@@ -28,23 +28,23 @@ module.exports = {
       // Back-off strategy — wait longer between crash restarts
       restart_delay:    5_000,   // 5s initial delay
       max_restarts:     10,       // give up after 10 rapid crashes
-      min_uptime:       "30s",   // must stay up 30s to count as stable
+      min_uptime:        "30s",   // must stay up 30s to count as stable
 
       // Log files (rotated by pm2-logrotate)
       out_file:  "./logs/bot-out.log",
       error_file: "./logs/bot-err.log",
-      time:      true,    // prefix log lines with timestamp
+      time:       true,    // prefix log lines with timestamp
 
       // Environment — set your real keys here or export them before running
       env: {
-        NODE_ENV:            "production",
+        NODE_ENV:           "production",
 
-        // ── Required ──────────────────────────────────────────────────
+        // ── Required ─────────────────────────────────────────────────
         // WALLET_PRIVATE_KEY: "your_base58_private_key",
         // HELIUS_API_KEY:     "your_helius_key",
         // BIRDEYE_API_KEY:    "your_birdeye_key",
 
-        // ── Optional overrides ────────────────────────────────────────
+        // ── Optional overrides ───────────────────────────────────────
         // RPC_ENDPOINT:   "https://mainnet.helius-rpc.com/?api-key=...",
         // JITO_ENABLED:   "true",
         // RL_STATE_PATH:  "./rl_state.json",

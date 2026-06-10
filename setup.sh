@@ -4,9 +4,9 @@
 
 set -e
 
-echo "=================================================="
+echo "================================================="
 echo "  Solana Trading Bot — Server Setup"
-echo "=================================================="
+echo "================================================="
 
 # ── 1. Node.js 20 ────────────────────────────────────────────────────────────
 if ! command -v node &>/dev/null; then
@@ -33,19 +33,19 @@ fi
 
 cd Sol-trade-bit
 
-# ── 4. Install dependencies ───────────────────────────────────────────────────
+# ── 4. Install dependencies ──────────────────────────────────────────────────
 echo "[setup] Installing npm packages..."
 npm install
 
-# ── 5. Create logs directory ──────────────────────────────────────────────────
+# ── 5. Create logs directory ─────────────────────────────────────────────────
 mkdir -p logs
 
-# ── 6. Prompt for API keys ────────────────────────────────────────────────────
+# ── 6. Prompt for API keys ───────────────────────────────────────────────────
 echo ""
-echo "=================================================="
+echo "================================================="
 echo "  Enter your API keys (leave blank to skip)"
-echo "  You can also edit pm2.config.js directly later"
-echo "=================================================="
+echo "  You can also edit .env directly later"
+echo "================================================="
 
 read -p "WALLET_PRIVATE_KEY (base58): " WALLET_KEY
 read -p "HELIUS_API_KEY:             " HELIUS_KEY
@@ -61,21 +61,20 @@ EOF
 
 echo "[setup] Keys saved to .env"
 
-# ── 7. Patch pm2.config.js to load .env ───────────────────────────────────────
-# pm2 --env flag reads env block in config; we export keys manually here too
+# ── 7. Export keys for current session ───────────────────────────────────────
 export $(grep -v '^#' .env | xargs) 2>/dev/null || true
 
 # ── 8. Start bot ─────────────────────────────────────────────────────────────
 echo ""
 echo "[setup] Starting bot with PM2..."
-pm2 start pm2.config.js
+pm2 start pm2.config.cjs
 
-# ── 9. Enable auto-start on reboot ────────────────────────────────────────────
+# ── 9. Enable auto-start on reboot ───────────────────────────────────────────
 pm2 save
 pm2 startup | tail -1 | bash || echo "[setup] Run the pm2 startup command above manually if it fails."
 
 echo ""
-echo "=================================================="
+echo "================================================="
 echo "  ✅  Bot is running!"
 echo ""
 echo "  Useful commands:"
@@ -84,4 +83,4 @@ echo "    pm2 monit            — CPU/RAM dashboard"
 echo "    pm2 restart sol-bot  — restart after code changes"
 echo "    pm2 stop sol-bot     — stop (saves RL state)"
 echo "    cd Sol-trade-bit && git pull && pm2 restart sol-bot  — update"
-echo "=================================================="
+echo "================================================="
