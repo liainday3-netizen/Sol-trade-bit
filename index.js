@@ -1367,15 +1367,14 @@ async function monitorCopyWallets(connection) {
               maxSupportedTransactionVersion: 0,
             });
 
-            // Skip TXs where KOL is not the fee payer (index 0).
-            // Trading terminals (Photon, BullX, etc.) use their own signers but the
-            // KOL wallet is always the fee payer / primary account.
-            const accountKeys = txDetail?.transaction?.message?.accountKeys || [];
-            const feePayer = accountKeys[0]?.pubkey?.toString();
-            if (feePayer !== walletAddr) {
-              console.log(`   ⏭️  Skipping TX — KOL is not fee payer (fee payer: ${feePayer?.slice(0,8)})`);
-              continue;
-            }
+            // NOTE: previously this skipped any TX where the KOL wasn't the fee
+            // payer (accountKeys[0]). That assumption is wrong in practice — most
+            // KOLs trade through terminals (Photon, BullX, Trojan, etc.) whose own
+            // relay wallet pays the fee, while the KOL's wallet only shows up as a
+            // token account owner in pre/postTokenBalances. That fee-payer check
+            // was discarding every real signal (100% skip rate observed in prod).
+            // The actual buy detection below (postBal.owner === walletAddr) is the
+            // correct and sufficient filter, so the fee-payer gate is removed.
 
             if (txDetail?.meta?.postTokenBalances && txDetail?.meta?.preTokenBalances) {
               const pre = txDetail.meta.preTokenBalances;
